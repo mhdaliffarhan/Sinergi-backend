@@ -68,16 +68,12 @@ def get_user(db: Session, username: str):
     ).all()
 
     # tambahkan atribut dinamis ke user
-    setattr(user, "ketua_tim_aktif", ketua_tim_aktif)  # list of Team yg masih valid
+    setattr(user, "ketua_tim_aktif", ketua_tim_aktif)
     setattr(user, "is_ketua_tim", len(ketua_tim_aktif) > 0)
 
     return user
 
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(database.get_db)):
-    """
-    Dependensi untuk mendapatkan user yang sedang login dari token.
-    Ini adalah "satpam" otentikasi.
-    """
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",

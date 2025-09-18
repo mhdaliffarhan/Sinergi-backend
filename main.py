@@ -18,7 +18,10 @@ import os, shutil, uuid, io, zipfile
 models.Base.metadata.create_all(bind=database.engine)
 app = FastAPI()
 
-origins = ["http://localhost:5173"]
+origins = [
+    "*"
+    ]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -37,7 +40,6 @@ app.mount("/dokumen", StaticFiles(directory="dokumen"), name="dokumen")
 if not os.path.exists(UPLOAD_PROFILE_PIC_DIR):
     os.makedirs(UPLOAD_PROFILE_PIC_DIR)
 app.mount("/profile-picture", StaticFiles(directory="profile-picture"), name="profile-picture")
-
 
 def get_document_path(db: Session, project_id: Optional[int] = None, aktivitas_id: Optional[int] = None):
     """
@@ -477,6 +479,29 @@ def get_team_details_with_activities(team_id: int, db: Session = Depends(databas
     
     return db_team
 
+@app.get("/api/teams/{team_id}/aktivitas", response_model=List[schemas.Aktivitas])
+def get_aktivitas_by_team_id(team_id: int, db: Session = Depends(database.get_db), current_user: models.User = Depends(security.get_current_user)):
+    """
+    Mengambil semua aktivitas yang terkait dengan ID tim tertentu.
+    Aktivitas akan diurutkan dari yang terbaru ke yang terlama.
+    """
+    # Pastikan tim yang dicari ada di database
+    db_team = db.query(models.Team).filter(models.Team.id == team_id).first()
+    if not db_team:
+        raise HTTPException(status_code=404, detail="Tim tidak ditemukan.")
+
+    # Query database untuk mencari semua aktivitas dengan team_id yang cocok
+    # Menggunakan joinedload untuk mengambil data terkait seperti dokumen dan daftar dokumen wajib
+    # Menggunakan .order_by() untuk mengurutkan data dari yang terbaru (dibuat pada)
+    db_aktivitas = db.query(models.Aktivitas).options(
+        joinedload(models.Aktivitas.dokumen),
+        joinedload(models.Aktivitas.daftar_dokumen_wajib),
+        joinedload(models.Aktivitas.creator)
+    ).filter(models.Aktivitas.team_id == team_id).order_by(models.Aktivitas.dibuat_pada.desc()).all()
+
+    # Mengembalikan daftar aktivitas
+    return db_aktivitas
+
 # ===================================================================
 # ENDPOINT UNTUK MANAJEMEN PROJECT
 # ===================================================================
@@ -878,7 +903,7 @@ def create_dokumen_untuk_aktivitas(
 @app.post("/api/aktivitas/{aktivitas_id}/link", response_model=schemas.Dokumen)
 def add_link_untuk_aktivitas(
     aktivitas_id: int,
-    link_data: schemas.DokumenCreate, # Kita akan gunakan kembali skema ini
+    link_data: schemas.DokumenCreate,
     db: Session = Depends(database.get_db)
 ):
     # Cek dulu apakah aktivitasnya ada
@@ -891,7 +916,7 @@ def add_link_untuk_aktivitas(
         aktivitas_id=aktivitas_id,
         keterangan=link_data.keterangan,
         tipe='LINK',
-        path_atau_url=link_data.pathAtauUrl # Kita asumsikan frontend mengirim URL di field ini
+        path_atau_url=link_data.pathAtauUrl
     )
 
     db.add(db_dokumen)

@@ -39,7 +39,7 @@ class SistemRole(CamelModel):
 # SKEMA UNTUK DOKUMEN
 # ===================================================================
 class DokumenBase(CamelModel):
-    keterangan: Optional[str] = None
+    keterangan: str
     tipe: str
     path_atau_url: Optional[str] = None
     nama_file_asli: Optional[str] = None
@@ -236,8 +236,13 @@ class TeamDetail(TeamBase):
     users: List[UserInTeam] = []
     ketua_tim: Optional[UserInTeam]
 
-class TeamCreate(TeamBase):
-    pass
+class TeamCreate(CamelModel):
+    nama_tim: str
+    valid_from: Optional[date] = None
+    valid_until: Optional[date] = None
+    ketua_tim_id: Optional[int] = None
+    warna: Optional[str] = None
+
 
 
 class TeamUpdate(TeamBase):
