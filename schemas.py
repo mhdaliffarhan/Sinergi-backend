@@ -349,6 +349,9 @@ class Aktivitas(AktivitasBase):
     daftar_dokumen_wajib: List[DaftarDokumen] = []
     users: List[UserInAktivitas] = []
 
+class AktivitasPage(CamelModel):
+    total: int
+    items: List[Aktivitas]
 
 # ===================================================================
 # SKEMA UNTUK AUTENTIKASI

@@ -2,7 +2,7 @@ from fastapi import (FastAPI, Depends, HTTPException, status, Response, File,
                      UploadFile, Form, Query)
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy import or_, desc, and_
+from sqlalchemy import or_, desc, and_, func
 from sqlalchemy.orm import Session, joinedload  
 from typing import List,  Optional
 from fastapi.middleware.cors import CORSMiddleware
@@ -311,32 +311,49 @@ def get_all_teams(
     db: Session = Depends(database.get_db),
     skip: int = 0, 
     limit: int = 10, 
-    search: Optional[str] = None
+    q: Optional[str] = None
 ):
     query = db.query(models.Team).options(joinedload(models.Team.ketua_tim))
-    if search:
-        query = query.filter(models.Team.nama_tim.ilike(f"%{search}%"))
+    if q:
+        query = query.filter(models.Team.nama_tim.ilike(f"%{q}%"))
     total = query.count()
     teams = query.order_by(desc(models.Team.valid_until), desc(models.Team.id)).offset(skip).limit(limit).all()
     return {"total": total, "items": teams}
 
-@app.get("/api/teams/active", response_model=list[schemas.Team], response_model_by_alias=True)
+@app.get("/api/teams/active", response_model=schemas.TeamPage, response_model_by_alias=True)
 def get_active_teams(
-    db: Session = Depends(database.get_db)
+    db: Session = Depends(database.get_db),
+    skip: int = 0,
+    limit: int = 10,
+    q: Optional[str] = None
 ):
     today = date.today()
-    teams = (
+
+    query = (
         db.query(models.Team)
+        .options(joinedload(models.Team.ketua_tim))
         .filter(
             and_(
                 models.Team.valid_from <= today,
                 models.Team.valid_until >= today
             )
         )
+    )
+
+    if q:
+        query = query.filter(models.Team.nama_tim.ilike(f"%{q}%"))
+
+    total = query.count()
+
+    teams = (
+        query
         .order_by(models.Team.nama_tim.asc())
+        .offset(skip)     
+        .limit(limit)       
         .all()
     )
-    return teams
+    return {"total": total, "items": teams}
+
 
 @app.put("/api/teams/{team_id}", response_model=schemas.Team, response_model_by_alias=True,
           dependencies=[Depends(security.require_role(["Superadmin", "Admin"]))])
@@ -521,15 +538,15 @@ def get_all_projects(
     db: Session = Depends(database.get_db),
     skip: int = 0,
     limit: int = 10,
-    search: Optional[str] = None
+    q: Optional[str] = None
 ):
     """Mendapatkan daftar semua proyek dengan paginasi dan pencarian."""
     query = db.query(models.Project).options(
         joinedload(models.Project.project_leader),
         joinedload(models.Project.team)
     )
-    if search:
-        query = query.filter(models.Project.nama_project.ilike(f"%{search}%"))
+    if q:
+        query = query.filter(models.Project.nama_project.ilike(f"%{q}%"))
     total = query.count()
     projects = query.order_by(models.Project.id.asc()).offset(skip).limit(limit).all()
     return {"total": total, "items": projects}
@@ -616,13 +633,14 @@ def get_all_jabatan(db: Session = Depends(database.get_db)):
     # Konversi manual
     return [schemas.Jabatan.from_orm(j) for j in jabatan_db]
 
-@app.get("/api/aktivitas", response_model=List[schemas.Aktivitas])
+@app.get("/api/aktivitas", response_model=schemas.AktivitasPage)
 def get_all_aktivitas(
     db: Session = Depends(database.get_db), 
+    skip: int = 0,
+    limit: int = 10,
     q: Optional[str] = None,
     current_user: models.User = Depends(security.get_current_user)
 ):
-    # Query dasar dengan eager loading dokumen
     query = db.query(models.Aktivitas).options(
         joinedload(models.Aktivitas.creator),
         joinedload(models.Aktivitas.team)
@@ -631,8 +649,9 @@ def get_all_aktivitas(
     # Jika ada parameter pencarian 'q'
     if q:
         search_term = f"%{q}%"
-        # Lakukan join dengan tabel dokumen agar bisa mencari di sana
+        # Lakukan join dengan tabel dokumen agar bisa mencari
         query = query.outerjoin(models.Dokumen)
+        
         # Filter berdasarkan beberapa kolom sekaligus
         query = query.filter(
             or_(
@@ -642,11 +661,31 @@ def get_all_aktivitas(
                 models.Dokumen.keterangan.ilike(search_term),
                 models.Dokumen.nama_file_asli.ilike(search_term)
             )
-        ).distinct() # Gunakan distinct agar aktivitas tidak muncul berulang
+        ).distinct()
 
-    # Urutkan berdasarkan ID terbaru dan ambil semua hasilnya
-    semua_aktivitas = query.order_by(models.Aktivitas.id.desc()).all()
-    return semua_aktivitas
+    # --- LOGIKA PAGINATION ---
+    
+    # 1. Hitung total item yang memenuhi filter/pencarian
+    # Karena ada .distinct(), kita harus menggunakan count pada subquery/ID
+    if q:
+        # Hitung jumlah ID yang berbeda untuk menghindari kesalahan count pada query dengan join dan distinct
+        total_query = db.query(func.count(models.Aktivitas.id.distinct())).select_from(query.subquery())
+        total = total_query.scalar()
+    else:
+        # Jika tidak ada distinct, count sederhana lebih cepat
+        total = query.count()
+        
+    # 2. Ambil data dengan sorting, offset, dan limit
+    aktivitas_items = (
+        query
+        .order_by(models.Aktivitas.id.desc())
+        .offset(skip)              # 👈 Terapkan skip (offset)
+        .limit(limit)              # 👈 Terapkan limit
+        .all()
+    )
+
+    # 3. Kembalikan hasil dalam format paging
+    return {"total": total, "items": aktivitas_items}
 
 @app.get("/api/aktivitas/kepala", response_model=List[schemas.Aktivitas])
 def get_aktivitas_kepala(
