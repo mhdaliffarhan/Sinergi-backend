@@ -102,9 +102,8 @@ class User(Base):
     teams = relationship("Team", secondary=user_team_link, back_populates="users")
     created_aktivitas = relationship("Aktivitas", back_populates="creator")
     created_projects = relationship("Project", back_populates="project_leader")
-    
-    # Gunakan objek Table yang sudah diperbaiki
     aktivitas = relationship("Aktivitas", secondary=anggota_aktivitas_link, back_populates="users")
+    notifikasi = relationship("Notifikasi", back_populates="user") 
 
 class SistemRole(Base):
     __tablename__ = "sistem_roles"
@@ -115,3 +114,20 @@ class Jabatan(Base):
     __tablename__ = "jabatan"
     id = Column(Integer, primary_key=True)
     nama_jabatan = Column(String, unique=True, nullable=False)
+
+class Notifikasi(Base):
+    __tablename__ = "notifikasi"
+    id = Column(Integer, primary_key=True, index=True)
+
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    related_activity_id = Column(Integer, ForeignKey("aktivitas.id", ondelete="CASCADE"), nullable=True)
+    related_project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=True)
+
+    title = Column(String(255), nullable=False)
+    massage = Column(Text, nullable=True)
+    link_to = Column(String, nullable=True)
+    is_read = Column(Boolean, default=False, nullable=False)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", back_populates="notifikasi")

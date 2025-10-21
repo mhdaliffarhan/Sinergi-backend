@@ -283,6 +283,10 @@ class ProjectAktivitas(CamelModel):
     id: int
     nama_aktivitas: str
     daftar_dokumen_wajib: List[DaftarDokumen] = []
+    tanggal_mulai: Optional[date] = None
+    tanggal_selesai: Optional[date] = None
+    jam_mulai: Optional[time] = None
+    jam_selesai: Optional[time] = None
 
 
 class Project(ProjectBase):
@@ -353,6 +357,10 @@ class AktivitasPage(CamelModel):
     total: int
     items: List[Aktivitas]
 
+class AktivitasTrendItem(CamelModel):
+    month_year: str
+    activity_count: int
+
 # ===================================================================
 # SKEMA UNTUK AUTENTIKASI
 # ===================================================================
@@ -364,6 +372,41 @@ class Token(CamelModel):
 class TokenData(BaseModel):
     username: Optional[str] = None
 
+# ===================================================================
+# SKEMA UNTUK NOTIFIKASI
+# ===================================================================
+class NotifikasiBase(CamelModel): 
+    # Kolom opsional saat notifikasi dibuat
+    massage: Optional[str] = None 
+    link_to: Optional[str] = None
+    
+    # Kolom wajib
+    title: str
+    user_id: int 
+    
+    # Foreign Keys
+    related_activity_id: Optional[int] = None
+    related_project_id: Optional[int] = None
+    
+    # Status
+    is_read: bool = Field(default=False)
+
+
+class NotifikasiCreate(NotifikasiBase):
+    pass
+
+
+class Notifikasi(NotifikasiBase):
+    id: int
+    created_at: datetime
+    pass
+
+class NotifikasiCount(CamelModel):
+    count: int
+
+class NotifikasiPage(CamelModel):
+    total: int
+    items: List[Notifikasi]
 
 # Rebuild model untuk mengatasi circular reference jika ada
 Team.model_rebuild()

@@ -102,6 +102,29 @@ def get_document_path(db: Session, project_id: Optional[int] = None, aktivitas_i
         
     return base_path
 
+def create_notification(
+    db: Session,
+    user_id: int,
+    title: str,
+    massage: str,
+    link_to: str,
+    activity_id: Optional[int] = None,
+    project_id: Optional[int] = None
+):
+    db_notif = models.Notifikasi(
+        user_id=user_id,
+        title=title,
+        massage=massage,
+        link_to=link_to,
+        related_activity_id=activity_id,
+        related_project_id=project_id,
+        is_read=False
+    )
+    db.add(db_notif)
+
+    return db_notif
+
+
 # ===================================================================
 # ENDPOINT OTENTIKASI & PENGGUNA
 # ===================================================================
@@ -445,6 +468,24 @@ def add_team_member(team_id: int, user_id: int, db: Session = Depends(database.g
     if db_user not in db_team.users:
         db_team.users.append(db_user)
         db.commit()
+
+        # --- LOGIKA NOTIFIKASI BARU: Anggota Ditambahkan ---
+        nama_tim = db_team.nama_tim
+        link_detail = f"/team/detail/{db_team.id}"
+        
+        title_notif = f"Anda ditambahkan ke Tim {nama_tim}"
+        message_notif = f"Anda sekarang adalah anggota Tim {nama_tim}. Klik untuk melihat detail tim."
+        
+        create_notification(
+            db, 
+            user_id=user_id, 
+            title=title_notif, 
+            massage=message_notif, 
+            link_to=link_detail
+        )
+        db.commit() # Commit notifikasi ke database
+        # --- END LOGIKA NOTIFIKASI ---
+
         db.refresh(db_team)
 
     return db_team
@@ -462,11 +503,28 @@ def remove_team_member(team_id: int, user_id: int, db: Session = Depends(databas
     if db_user not in db_team.users:
         raise HTTPException(status_code=400, detail="Pengguna bukan anggota tim ini")
 
+    nama_tim = db_team.nama_tim
+
     if db_user in db_team.users:
         db_team.users.remove(db_user)
         db.commit()
-        db.refresh(db_team)
 
+    # --- LOGIKA NOTIFIKASI BARU: Anggota Dihapus ---
+    
+    title_notif = f"Keanggotaan Tim Berakhir"
+    message_notif = f"Anda telah dikeluarkan dari Tim {nama_tim} oleh Administrator. Anda tidak lagi memiliki akses ke proyek dan aktivitas tim tersebut."
+    
+    create_notification(
+        db, 
+        user_id=user_id, 
+        title=title_notif, 
+        massage=message_notif, 
+        link_to="/team" 
+    )
+    db.commit() # Commit notifikasi
+    # --- END LOGIKA NOTIFIKASI ---
+    
+    db.refresh(db_team)
     return db_team
 
 @app.get("/api/teams/{team_id}/details", response_model=schemas.TeamDetail, response_model_by_alias=True)
@@ -519,18 +577,109 @@ def get_aktivitas_by_team_id(team_id: int, db: Session = Depends(database.get_db
     # Mengembalikan daftar aktivitas
     return db_aktivitas
 
+@app.get("/api/aktivitas/trend", response_model=List[schemas.AktivitasTrendItem])
+def get_aktivitas_trend(
+    db: Session = Depends(database.get_db),
+    group_by: str = Query(..., description="Filter group: 'team' atau 'user'."),
+    group_id: int = Query(..., description="ID of the Team atau User."),
+    months: int = Query(6, description="Number of months history to retrieve.")
+):
+    """Mengambil tren jumlah aktivitas per bulan untuk group_id tertentu (max 6 bulan)."""
+    
+    today = date.today()
+    # Hitung tanggal mulai 6 bulan ke belakang
+    start_date = today.replace(day=1) - timedelta(days=30 * (months - 1)) 
+    
+    # 1. Build the base query for activity count grouped by year and month
+    query = db.query(
+        func.to_char(models.Aktivitas.tanggal_mulai, 'YYYY-MM').label('month_year'),
+        func.count(models.Aktivitas.id).label('activity_count')
+    ).filter(
+        models.Aktivitas.tanggal_mulai >= start_date 
+    )
+
+    # 2. Apply filtering based on group_by parameter
+    if group_by == 'team':
+        query = query.filter(models.Aktivitas.team_id == group_id)
+    elif group_by == 'user':
+        # Join dengan tabel perantara anggota_aktivitas_link
+        query = query.join(models.anggota_aktivitas_link).filter(
+            models.anggota_aktivitas_link.c.user_id == group_id
+        )
+    else:
+        raise HTTPException(status_code=400, detail="Parameter group_by tidak valid. Gunakan 'team' atau 'user'.")
+
+    # 3. Group the results and order by month
+    results = query.group_by('month_year').order_by('month_year').all()
+
+    # 4. Format output (raw data, frontend yang akan mengisi nol)
+    trend_data = [
+        {"month_year": row.month_year, "activity_count": row.activity_count}
+        for row in results
+    ]
+    
+    return trend_data
+
+
 # ===================================================================
 # ENDPOINT UNTUK MANAJEMEN PROJECT
 # ===================================================================
 
 @app.post("/api/projects", response_model=schemas.Project, response_model_by_alias=True)
 def create_project(project: schemas.ProjectCreate, db: Session = Depends(database.get_db)):
-    """Membuat proyek baru (hanya Superadmin atau Admin)."""
     project_data = project.dict(by_alias=False)
     db_project = models.Project(**project_data)
     db.add(db_project)
     db.commit()
     db.refresh(db_project)
+
+    # 1. Muat Project dengan relasi Team dan Anggota
+    project_with_relations = db.query(models.Project).options(
+        joinedload(models.Project.team).joinedload(models.Team.users)
+    ).filter(models.Project.id == db_project.id).first()
+    
+    if not project_with_relations or not project_with_relations.team:
+        # Lanjutkan jika tidak ada tim terkait (meskipun skema mengharuskan team_id)
+        return db_project 
+    
+    nama_project = project_with_relations.nama_project
+    project_leader_id = project_with_relations.project_leader_id
+    link_detail = f"/project/detail/{db_project.id}"
+    
+    # 2. Definisikan Notifikasi Umum (Untuk Semua Anggota Tim)
+    title_umum = f"Project Baru ditambahkan: {nama_project}"
+    message_umum = f"Ketua Tim Anda telah membuat Project baru di bawah Tim {project_with_relations.team.nama_tim}."
+    
+    # 3. Definisikan Notifikasi Khusus (Untuk Project Leader)
+    title_leader = f"Anda Project Leader Project {nama_project}!"
+    message_leader = "Anda telah ditunjuk sebagai Project Leader."
+    
+    # 4. Loop dan Kirim Notifikasi
+    for user in project_with_relations.team.users:
+        if user.id == project_leader_id:
+            # Notifikasi Khusus untuk Leader
+            create_notification(
+                db, 
+                user_id=user.id, 
+                title=title_leader, 
+                massage=message_leader, 
+                link_to=link_detail, 
+                project_id=db_project.id
+            )
+        else:
+            # Notifikasi Umum untuk Anggota
+            create_notification(
+                db, 
+                user_id=user.id, 
+                title=title_umum, 
+                massage=message_umum, 
+                link_to=link_detail, 
+                project_id=db_project.id
+            )
+            
+    db.commit() # Commit notifikasi
+    # --- END LOGIKA NOTIFIKASI ---
+
     return db_project
 
 @app.get("/api/projects", response_model=schemas.ProjectPage, response_model_by_alias=True)
@@ -555,7 +704,6 @@ def get_all_projects(
 def get_project_by_id(project_id: int, db: Session = Depends(database.get_db)):
     """Mendapatkan detail proyek dan daftar aktivitas aktif yang relevan."""
     
-    # Ambil data proyek secara utuh
     db_project = db.query(models.Project).options(
         joinedload(models.Project.project_leader),
         joinedload(models.Project.team),
@@ -566,30 +714,35 @@ def get_project_by_id(project_id: int, db: Session = Depends(database.get_db)):
         raise HTTPException(status_code=404, detail="Proyek tidak ditemukan")
 
     # Filter dan muat hanya aktivitas yang sedang aktif
-    today = date.today()
-    active_aktivitas = db.query(models.Aktivitas).options(
+    # today = date.today()
+    # active_aktivitas = db.query(models.Aktivitas).options(
+    #     joinedload(models.Aktivitas.daftar_dokumen_wajib)
+    # ).with_parent(db_project).filter(
+    #     or_( # Gunakan OR untuk dua kondisi
+    #         # Kondisi 1: Aktivitas dengan rentang tanggal
+    #         and_(
+    #             models.Aktivitas.tanggal_selesai.isnot(None),
+    #             models.Aktivitas.tanggal_mulai <= today,
+    #             models.Aktivitas.tanggal_selesai >= today
+    #         ),
+    #         # Kondisi 2: Aktivitas satu hari tanpa jam
+    #         and_(
+    #             models.Aktivitas.tanggal_selesai.is_(None),
+    #             models.Aktivitas.jam_mulai.is_(None),
+    #             models.Aktivitas.jam_selesai.is_(None),
+    #             models.Aktivitas.tanggal_mulai == today
+    #         )
+    #     )
+    # ).all()
+    # db_project.aktivitas = active_aktivitas
+
+    all_aktivitas = db.query(models.Aktivitas).options(
         joinedload(models.Aktivitas.daftar_dokumen_wajib)
-    ).with_parent(db_project).filter(
-        or_( # Gunakan OR untuk dua kondisi
-            # Kondisi 1: Aktivitas dengan rentang tanggal
-            and_(
-                models.Aktivitas.tanggal_selesai.isnot(None),
-                models.Aktivitas.tanggal_mulai <= today,
-                models.Aktivitas.tanggal_selesai >= today
-            ),
-            # Kondisi 2: Aktivitas satu hari tanpa jam
-            and_(
-                models.Aktivitas.tanggal_selesai.is_(None),
-                models.Aktivitas.jam_mulai.is_(None),
-                models.Aktivitas.jam_selesai.is_(None),
-                models.Aktivitas.tanggal_mulai == today
-            )
-        )
+    ).with_parent(db_project).order_by(
+        desc(models.Aktivitas.tanggal_mulai)
     ).all()
 
-    # Tambahkan daftar aktivitas yang sudah difilter ke objek proyek
-    db_project.aktivitas = active_aktivitas
-
+    db_project.aktivitas = all_aktivitas
     return db_project
 
 @app.put("/api/projects/{project_id}", response_model=schemas.Project, response_model_by_alias=True)
@@ -755,6 +908,38 @@ def create_aktivitas(
     db.commit()
     db.refresh(db_aktivitas)
     
+    # LOGIKA PENGIRIMAN NOTIFIKASI
+    if db_aktivitas.users:
+        # Muat relasi Team dan Project yang baru dibuat untuk mendapatkan Nama Tim, Project
+        aktivitas_with_relations = db.query(models.Aktivitas).options(
+            joinedload(models.Aktivitas.team),
+            joinedload(models.Aktivitas.project)
+        ).filter(models.Aktivitas.id == db_aktivitas.id).first()
+
+        nama_aktivitas = aktivitas_with_relations.nama_aktivitas
+        nama_tim = aktivitas_with_relations.team.nama_tim if aktivitas_with_relations.team else "Tim Tidak Diketahui"
+        tanggal_mulai_str = aktivitas_with_relations.tanggal_mulai.strftime("%d %B %Y")
+        link_detail = f"/aktivitas/detail/{db_aktivitas.id}"
+        
+        # Kirim notifikasi ke setiap pengguna yang terlibat
+        for user in db_aktivitas.users:
+            title = f"Anda ditambahkan ke Aktivitas: {nama_aktivitas}"
+            massage = f"Aktivitas ini di bawah tim '{nama_tim}' dan dijadwalkan mulai {tanggal_mulai_str}."
+            
+            create_notification(
+                db, 
+                user_id=user.id, 
+                title=title, 
+                massage=massage, 
+                link_to=link_detail, 
+                activity_id=db_aktivitas.id, 
+                project_id=db_aktivitas.project_id
+            )
+        
+        # Commit notifikasi di akhir
+        db.commit()
+    # END: LOGIKA PENGIRIMAN NOTIFIKASI
+
     print(f"Aktivitas berhasil disimpan dengan ID: {db_aktivitas.id}")
     print(f"Total anggota yang tersimpan di database: {len(db_aktivitas.users)}")
     print("--- Proses selesai ---")
@@ -855,7 +1040,11 @@ def update_aktivitas(
 
 # --- ENDPOINT MENGHAPUS AKTIVITAS ---
 @app.delete("/api/aktivitas/{aktivitas_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_aktivitas(aktivitas_id: int, db: Session = Depends(database.get_db)):
+def delete_aktivitas(
+    aktivitas_id: int, 
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(security.get_current_user)
+):
     aktivitas_to_delete = db.query(models.Aktivitas).filter(models.Aktivitas.id == aktivitas_id).first()
 
     if aktivitas_to_delete is None:
@@ -866,6 +1055,31 @@ def delete_aktivitas(aktivitas_id: int, db: Session = Depends(database.get_db)):
             status_code=status.HTTP_409_CONFLICT,
             detail="Tidak dapat menghapus aktivitas karena masih terdapat dokumen terkait. Harap hapus semua dokumen terkait terlebih dahulu."
         )
+
+    nama_aktivitas = aktivitas_to_delete.nama_aktivitas
+    users_terlibat = aktivitas_to_delete.team.users if aktivitas_to_delete.team else []
+
+    # --- LOGIKA NOTIFIKASI: SEBELUM PENGHAPUSAN ---
+    if users_terlibat:
+        title_notif = f"Aktivitas Dihapus: {nama_aktivitas}"
+        message_notif = (
+            f"Aktivitas '{nama_aktivitas}' telah dihapus oleh {current_user.nama_lengkap}. "
+            "Semua data terkait telah dihilangkan."
+        )
+        
+        # Kirim notifikasi ke semua anggota yang terlibat
+        for user in users_terlibat:
+            create_notification(
+                db, 
+                user_id=user.id, 
+                title=title_notif, 
+                massage=message_notif, 
+                # Tidak ada link karena aktivitas sudah hilang
+                link_to="/dashboard", 
+                activity_id=None # Tidak ada activity_id yang relevan
+            )
+        db.commit() # Commit notifikasi
+    # --- END LOGIKA NOTIFIKASI ---
 
     # Hapus semua entri di tabel perantara 'anggota_aktivitas' secara manual
     db.query(models.anggota_aktivitas_link).filter(models.anggota_aktivitas_link.c.aktivitas_id == aktivitas_id).delete(synchronize_session=False)
@@ -955,7 +1169,7 @@ def add_link_untuk_aktivitas(
         aktivitas_id=aktivitas_id,
         keterangan=link_data.keterangan,
         tipe='LINK',
-        path_atau_url=link_data.pathAtauUrl
+        path_atau_url=link_data.path_atau_url
     )
 
     db.add(db_dokumen)
@@ -1031,7 +1245,7 @@ def add_link_untuk_proyek(
         project_id=project_id,
         keterangan=link_data.keterangan,
         tipe='LINK',
-        path_atau_url=link_data.pathAtauUrl
+        path_atau_url=link_data.path_atau_url
     )
     
     db.add(db_dokumen)
@@ -1135,7 +1349,7 @@ def update_status_pengecekan(
     Memperbarui status pengecekan (true/false) untuk sebuah item di daftar dokumen.
     Hanya bisa dilakukan oleh ketua tim dari aktivitas terkait.
     """
-    # 1. Cari item checklist di database, lakukan join untuk mengambil data tim terkait
+    # Cari item checklist di database, lakukan join untuk mengambil data tim terkait
     db_item = db.query(models.DaftarDokumen).options(
         joinedload(models.DaftarDokumen.aktivitas).joinedload(models.Aktivitas.team)
     ).filter(models.DaftarDokumen.id == item_id).first()
@@ -1146,7 +1360,11 @@ def update_status_pengecekan(
             detail="Item checklist tidak ditemukan"
         )
 
-    # 2. Validasi Keamanan: Pastikan pengguna adalah ketua tim
+    # Ambil status lama sebelum diubah
+    old_status = db_item.status_pengecekan
+    new_status = status_update.status_pengecekan
+
+    # Validasi Keamanan: Pastikan pengguna adalah ketua tim
     # Pastikan ada aktivitas dan tim yang tertaut sebelum memeriksa
     if not db_item.aktivitas or not db_item.aktivitas.team:
           raise HTTPException(
@@ -1154,9 +1372,41 @@ def update_status_pengecekan(
             detail="Item checklist tidak terhubung dengan tim yang valid"
         )
 
-    # 3. Jika validasi berhasil, perbarui status
+    # Jika validasi berhasil, perbarui status
     db_item.status_pengecekan = status_update.status_pengecekan
     db.commit()
+
+    # --- LOGIKA NOTIFIKASI BARU (Feedback Kritis) ---
+    if old_status != new_status and db_item.dokumen_id:
+        
+        # A. Tentukan Konten Notifikasi
+        nama_dokumen = db_item.nama_dokumen
+        nama_aktivitas = db_item.aktivitas.nama_aktivitas
+        link_detail = f"/aktivitas/detail/{db_item.aktivitas_id}"
+        
+        if new_status is True:
+            title_notif = f"Dokumen Disetujui: {nama_dokumen}"
+            message_notif = f"Dokumen Anda di aktivitas '{nama_aktivitas}' telah divalidasi dan disetujui oleh {current_user.nama_lengkap}."
+        else: # new_status is False (Pembatalan persetujuan)
+            title_notif = f"Persetujuan Dibatalkan: {nama_dokumen}"
+            message_notif = f"Persetujuan dokumen Anda di aktivitas '{nama_aktivitas}' dibatalkan oleh {current_user.nama_lengkap} untuk diperbaiki."
+        
+        # B. Kirim Notifikasi ke semua Anggota Aktivitas
+        if db_item.aktivitas.users:
+            for user in db_item.aktivitas.users:
+                # Kirim ke semua anggota aktivitas
+                create_notification(
+                    db,
+                    user_id=user.id,
+                    title=title_notif,
+                    massage=message_notif, # Menggunakan 'massage' sesuai model DB
+                    link_to=link_detail,
+                    activity_id=db_item.aktivitas_id
+                )
+            db.commit() # Commit notifikasi
+            
+    # --- END LOGIKA NOTIFIKASI ---
+
     db.refresh(db_item)
     
     # 4. Kembalikan data yang sudah diperbarui
@@ -1437,3 +1687,108 @@ def get_calendar_events(
             raise HTTPException(status_code=400, detail="Format team_ids tidak valid.")
     
     return query.all()
+
+# ===================================================================
+# ENDPOINT UNTUK NOTIFKIKASI
+# ===================================================================
+
+# Endpoint 1: GET /api/notifications/count (Untuk Polling Badge)
+@app.get("/api/notifications/count")
+def get_unread_notification_count(
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(security.get_current_user)
+):
+    """Menghitung jumlah notifikasi yang belum dibaca untuk pengguna."""
+    
+    unread_count = db.query(models.Notifikasi).filter(
+        models.Notifikasi.user_id == current_user.id,
+        models.Notifikasi.is_read == False
+    ).count()
+    
+    return {"count": unread_count}
+
+# Endpoint 2: GET /api/notifications (Untuk Dropdown List)
+@app.get("/api/notifications/header", response_model=List[schemas.Notifikasi]) 
+def get_header_notifications(
+    db: Session = Depends(database.get_db), 
+    current_user: models.User = Depends(security.get_current_user), 
+    limit: int = 15
+):
+    """Mengambil daftar notifikasi terbaru (list saja) untuk header dropdown."""
+    
+    notifications = db.query(models.Notifikasi).options(
+        joinedload(models.Notifikasi.user) 
+    ).filter(
+        models.Notifikasi.user_id == current_user.id
+    ).order_by(
+        models.Notifikasi.created_at.desc() 
+    ).limit(limit).all()
+    
+    return notifications
+
+
+# Endpoint 2b: GET /api/notifications (Paginated untuk Halaman View All)
+# Endpoint ini yang sebelumnya bermasalah karena dipanggil oleh header. Sekarang hanya untuk NotifikasiView.
+@app.get("/api/notifications", response_model=schemas.NotifikasiPage) 
+def get_user_notifications_paginated(
+    db: Session = Depends(database.get_db), 
+    current_user: models.User = Depends(security.get_current_user), 
+    skip: int = 0,
+    limit: int = 20, 
+    is_read: Optional[bool] = Query(None) 
+):
+    """Mengambil daftar notifikasi terbaru untuk pengguna dengan dukungan paginasi."""
+    
+    query = db.query(models.Notifikasi).options(
+        joinedload(models.Notifikasi.user) 
+    ).filter(
+        models.Notifikasi.user_id == current_user.id
+    )
+    
+    if is_read is not None:
+        query = query.filter(models.Notifikasi.is_read == is_read)
+
+    total = query.count()
+    
+    notifications = query.order_by(
+        models.Notifikasi.created_at.desc()
+    ).offset(skip).limit(limit).all()
+    
+    return {"total": total, "items": notifications} 
+
+
+# Endpoint 3: PATCH /api/notifications/{id}/read (Untuk Mark as Read)
+@app.patch("/api/notifications/{notification_id}/read")
+def mark_notification_as_read(
+    notification_id: int, 
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(security.get_current_user)
+):
+    """Menandai notifikasi sebagai sudah dibaca."""
+    
+    # 1. Cari notifikasi, pastikan dimiliki oleh user saat ini
+    db_notification = db.query(models.Notifikasi).filter(
+        models.Notifikasi.id == notification_id,
+        models.Notifikasi.user_id == current_user.id
+    ).first()
+    
+    if not db_notification:
+        raise HTTPException(status_code=404, detail="Notifikasi tidak ditemukan")
+    
+    # 2. Update status
+    db_notification.is_read = True
+    db.commit()
+    db.refresh(db_notification)
+    
+    return {"message": "Notifikasi berhasil ditandai sebagai sudah dibaca"}
+
+@app.patch("/api/notifications/mark-all-read")
+def mark_all_as_read(current_user: models.User = Depends(security.get_current_user), db: Session = Depends(database.get_db)):
+    """Menandai SEMUA notifikasi pengguna sebagai sudah dibaca."""
+    db.query(models.Notifikasi).filter(
+        models.Notifikasi.user_id == current_user.id,
+        models.Notifikasi.is_read == False
+    ).update({"is_read": True}, synchronize_session=False)
+    
+    db.commit()
+    return {"message": "Semua notifikasi berhasil ditandai sebagai sudah dibaca"}
