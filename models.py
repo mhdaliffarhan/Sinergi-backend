@@ -1,11 +1,13 @@
-from sqlalchemy import Column, Integer, String, Text, TIMESTAMP, Time, ForeignKey, Table, Boolean, DATE, DateTime
+from sqlalchemy import Column, Integer, String, Text, text, TIMESTAMP, Time, ForeignKey, Table, Boolean, DATE, DateTime
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
+from sqlalchemy.dialects.postgresql import UUID
 from database import Base
 
 user_team_link = Table('user_team_link', Base.metadata,
     Column('user_id', Integer, ForeignKey('users.id'), primary_key=True),
-    Column('team_id', Integer, ForeignKey('teams.id'), primary_key=True)
+    Column('team_id', Integer, ForeignKey('teams.id'), primary_key=True),
+    Column('team_role', String(50), nullable=False, server_default='member')
 )
 
 anggota_aktivitas_link = Table('anggota_aktivitas', Base.metadata,
@@ -42,6 +44,16 @@ class Project(Base):
 class Aktivitas(Base):
     __tablename__ = "aktivitas"
     id = Column(Integer, primary_key=True, index=True)
+
+    public_id = Column(
+        UUID(as_uuid=True),
+        primary_key = False,
+        server_default=text("gen_random_uuid()"),
+        nullable=False,
+        unique=True,
+        index=True
+    )
+
     nama_aktivitas = Column(String, index=True, nullable=False)
     deskripsi = Column(Text, nullable=True)
     tanggal_mulai = Column(DATE, nullable=True)

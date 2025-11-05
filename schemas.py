@@ -1,9 +1,8 @@
 from __future__ import annotations
+from uuid import UUID
 
 from pydantic import BaseModel, model_validator, field_validator, Field, ConfigDict
-
 from typing import Optional, Any, List
-
 from datetime import date, time, datetime
 
 
@@ -78,6 +77,8 @@ class UserInTeam(CamelModel):
     foto_profil_url: Optional[str] = None
     jabatan: Optional[Jabatan] = None
 
+class UserInTeamWithRole(UserInTeam):
+    peran: str
 
 class UserInProject(CamelModel):
     id: int
@@ -100,6 +101,9 @@ class TeamInUser(CamelModel):
     valid_from: Optional[date] = None
     valid_until: Optional[date] = None
 
+# Skema ini mewarisi dari TeamInUser dan menambahkan field 'peran'
+class TeamInUserWithRole(TeamInUser):
+    peran: str
 
 # Skema untuk Project yang akan digunakan di dalam User
 class ProjectInUser(CamelModel):
@@ -116,7 +120,6 @@ class AktivitasInUser(CamelModel):
     tanggal_selesai: Optional[date] = None
     jam_mulai: Optional[time] = None
     jam_selesai: Optional[time] = None
-
 
 # Base dan Create skema untuk User
 class UserBase(CamelModel):
@@ -148,9 +151,9 @@ class User(UserBase):
     is_active: bool
     sistem_role: SistemRole
     jabatan: Optional[Jabatan] = None
-    teams: List[TeamInUser] = []
+    teams: List[TeamInUserWithRole] = []
     created_projects: List[ProjectInUser] = []
-    aktivitas: List[AktivitasInUser] = [] # Tambahan: Daftar aktivitas yang melibatkan user
+    aktivitas: List[AktivitasInUser] = [] 
 
 
 # Skema khusus untuk endpoint "me" yang menampilkan informasi lebih detail
@@ -159,11 +162,11 @@ class UserWithTeams(UserBase):
     is_active: bool
     sistem_role: SistemRole
     jabatan: Optional[Jabatan] = None
-    teams: List[TeamInUser] = []
+    teams: List[TeamInUserWithRole] = []
     is_ketua_tim: bool = False
     ketua_tim_aktif: List[TeamInUser] = []
     created_projects: List[ProjectInUser] = []
-    aktivitas: List[AktivitasInUser] = [] # Tambahan: Daftar aktivitas yang melibatkan user
+    aktivitas: List[AktivitasInUser] = [] 
 
 
 class UserUpdate(CamelModel):
@@ -233,7 +236,7 @@ class TeamBase(CamelModel):
 class TeamDetail(TeamBase):
     projects: List[ProjectInTeam] = []
     aktivitas: List[AktivitasInTeam] = []
-    users: List[UserInTeam] = []
+    users: List[UserInTeamWithRole] = []
     ketua_tim: Optional[UserInTeam]
 
 class TeamCreate(CamelModel):
@@ -242,11 +245,17 @@ class TeamCreate(CamelModel):
     valid_until: Optional[date] = None
     ketua_tim_id: Optional[int] = None
     warna: Optional[str] = None
+    operator_ids: list[int] = []
 
 
 
-class TeamUpdate(TeamBase):
-    pass
+class TeamUpdate(CamelModel):
+    nama_tim: Optional[str] = None
+    valid_from: Optional[date] = None
+    valid_until: Optional[date] = None
+    ketua_tim_id: Optional[int] = None
+    warna: Optional[str] = None
+    operator_ids: Optional[list[int]] = None
 
 
 # Skema utama untuk menampilkan Team secara penuh
@@ -346,6 +355,7 @@ class AktivitasCreate(AktivitasBase):
 class Aktivitas(AktivitasBase):
     id: int
     dibuat_pada: datetime
+    public_id: UUID
     creator: Optional[UserInTeam] = None
     team: Optional[TeamInProject] = None
     project: Optional[ProjectInUser] = None
@@ -411,5 +421,7 @@ class NotifikasiPage(CamelModel):
 # Rebuild model untuk mengatasi circular reference jika ada
 Team.model_rebuild()
 User.model_rebuild()
+UserWithTeams.model_rebuild()
+TeamDetail.model_rebuild()
 Aktivitas.model_rebuild()
 Project.model_rebuild()

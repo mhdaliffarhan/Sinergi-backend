@@ -2,14 +2,15 @@ from fastapi import (FastAPI, Depends, HTTPException, status, Response, File,
                      UploadFile, Form, Query)
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy import or_, desc, and_, func
-from sqlalchemy.orm import Session, joinedload  
+from sqlalchemy import or_, desc, and_, func, insert, select, update, extract
+from sqlalchemy.orm import Session, joinedload
 from typing import List,  Optional
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from datetime import timedelta, date, datetime
+from openpyxl import Workbook
 
-import models, database, schemas, security
+import models, database, schemas, security, uuid, io
 import os, shutil, uuid, io, zipfile
 
 # ===================================================================
@@ -138,9 +139,59 @@ def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db:
     content = {"accessToken": token, "tokenType": "bearer"}
     return JSONResponse(content=content)
 
+# Di dalam file main.py
+
+# ... (kode lainnya) ...
+
 @app.get("/users/me", response_model=schemas.UserWithTeams, response_model_by_alias=True)
-def read_users_me(current_user: models.User = Depends(security.get_current_user)):
-    return current_user
+def read_users_me(current_user: models.User = Depends(security.get_current_user), db: Session = Depends(database.get_db)):
+    
+    # --- LOGIKA UNTUK MENGAMBIL PERAN TIM ---
+    teams_with_role = []
+    
+    # Query untuk mendapatkan semua tim dan peran user terkait dari user_team_link
+    user_teams_links = db.query(
+        models.Team, 
+        models.user_team_link.c.team_role
+    ).join(
+        models.user_team_link, models.user_team_link.c.team_id == models.Team.id
+    ).filter(
+        models.user_team_link.c.user_id == current_user.id
+    ).all()
+
+    for team, role in user_teams_links:
+        teams_with_role.append({
+            "id": team.id,
+            "nama_tim": team.nama_tim,
+            "peran": role # 'member' atau 'operator'
+        })
+    
+    # --- LOGIKA UNTUK MENENTUKAN is_ketua_tim & ketua_tim_aktif ---
+    ketua_tim_aktif_list = db.query(models.Team).filter(models.Team.ketua_tim_id == current_user.id).all()
+    is_ketua = len(ketua_tim_aktif_list) > 0
+    
+    # --- BANGUN DICTIONARY RESPONS SECARA MANUAL UNTUK KEAMANAN ---
+    # Ini menghindari error konversi otomatis Pydantic yang kompleks
+    response_data = {
+        "id": current_user.id,
+        "username": current_user.username,
+        "nama_lengkap": current_user.nama_lengkap,
+        "foto_profil_url": current_user.foto_profil_url,
+        "is_active": current_user.is_active,
+        "sistem_role": current_user.sistem_role,
+        "jabatan": current_user.jabatan,
+        
+        # Data relasi lain yang dibutuhkan oleh skema UserWithTeams
+        "created_projects": current_user.created_projects,
+        "aktivitas": current_user.aktivitas,
+        
+        # Data yang kita proses secara manual dari atas
+        "teams": teams_with_role,
+        "is_ketua_tim": is_ketua,
+        "ketua_tim_aktif": ketua_tim_aktif_list,
+    }
+    
+    return response_data
 
 @app.post("/api/{user_id}/upload-photo")
 def upload_profile_photo(user_id: int, file: UploadFile = File(...), db: Session = Depends(database.get_db)):
@@ -257,8 +308,45 @@ def get_all_users(
         ).distinct()
 
     total = query.count()
-    users = query.order_by(models.User.id.desc()).offset(skip).limit(limit).all()
-    return {"total": total, "items": users}
+    users_from_db = query.order_by(models.User.id.desc()).offset(skip).limit(limit).all()
+
+    processed_users = []
+    for user in users_from_db:
+        teams_with_role = []
+        
+        # Query untuk mendapatkan peran tim untuk setiap user dalam loop
+        user_teams_links = db.query(
+            models.Team, 
+            models.user_team_link.c.team_role
+        ).join(
+            models.user_team_link, models.user_team_link.c.team_id == models.Team.id
+        ).filter(
+            models.user_team_link.c.user_id == user.id
+        ).all()
+
+        for team, role in user_teams_links:
+            teams_with_role.append({
+                "id": team.id,
+                "nama_tim": team.nama_tim,
+                "peran": role
+            })
+        
+        # Buat dictionary yang sesuai dengan skema User
+        user_dict = {
+            "id": user.id,
+            "username": user.username,
+            "nama_lengkap": user.nama_lengkap,
+            "foto_profil_url": user.foto_profil_url,
+            "is_active": user.is_active,
+            "sistem_role": user.sistem_role,
+            "jabatan": user.jabatan,
+            "created_projects": user.created_projects,
+            "aktivitas": user.aktivitas,
+            "teams": teams_with_role # Gunakan data yang sudah diproses
+        }
+        processed_users.append(user_dict)
+
+    return {"total": total, "items": processed_users}
 
 @app.put("/api/users/{user_id}", response_model=schemas.User, response_model_by_alias=True, dependencies=[Depends(security.require_role(["Superadmin"]))])
 def update_user(user_id: int, user_update: schemas.UserUpdate, db: Session = Depends(database.get_db)):
@@ -302,6 +390,7 @@ def delete_user(user_id: int, db: Session = Depends(database.get_db)):
 
 @app.post("/api/teams", response_model=schemas.Team, response_model_by_alias=True, dependencies=[Depends(security.require_role(["Superadmin", "Admin"]))])
 def create_team(team: schemas.TeamCreate, db: Session = Depends(database.get_db)):
+    # 1. Buat instance model Team
     db_team = models.Team(
         nama_tim=team.nama_tim,
         valid_from=team.valid_from,
@@ -309,24 +398,38 @@ def create_team(team: schemas.TeamCreate, db: Session = Depends(database.get_db)
         ketua_tim_id=team.ketua_tim_id,
         warna=team.warna
     )
-
-    # Pastikan ketua_tim_id ada dan bukan null
-    if team.ketua_tim_id:
-        ketua_tim_user = db.query(models.User).filter(models.User.id == team.ketua_tim_id).first()
-        if not ketua_tim_user:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Ketua Tim tidak ditemukan."
-            )
-        
-        # Tambahkan objek User ke relationship 'users' tim
-        db_team.users.append(ketua_tim_user)
-        # SQLAlchemy akan secara otomatis membuat entri di user_team_link
-
-    # 3. Simpan Tim ke database
     db.add(db_team)
+    db.flush()  # Gunakan flush untuk mendapatkan ID tim (db_team.id) tanpa mengakhiri transaksi
+
+    # 2. Siapkan data untuk tabel user_team_link
+    operator_ids_set = set(team.operator_ids)
+    
+    # Gabungkan ID ketua dan operator, pastikan tidak ada duplikasi
+    all_member_ids = {team.ketua_tim_id} | operator_ids_set if team.ketua_tim_id else operator_ids_set
+
+    links_to_create = []
+    if all_member_ids:
+        # Cek apakah semua user valid dalam satu query untuk efisiensi
+        valid_users = db.query(models.User).filter(models.User.id.in_(all_member_ids)).all()
+        valid_user_ids = {user.id for user in valid_users}
+
+        for user_id in valid_user_ids:
+            # Peran operator memiliki prioritas lebih tinggi
+            role = 'operator' if user_id in operator_ids_set else 'member'
+            links_to_create.append({
+                "user_id": user_id,
+                "team_id": db_team.id,
+                "team_role": role
+            })
+
+    # 3. Eksekusi bulk insert ke tabel user_team_link jika ada data
+    if links_to_create:
+        db.execute(insert(models.user_team_link), links_to_create)
+    
+    # 4. Commit semua perubahan (pembuatan tim dan penambahan anggota) dalam satu transaksi
     db.commit()
     db.refresh(db_team)
+    
     return db_team
 
 @app.get("/api/teams", response_model=schemas.TeamPage, response_model_by_alias=True)
@@ -400,6 +503,27 @@ def update_team(team_id: int, team_update: schemas.TeamUpdate, db: Session = Dep
             if not ketua_user:
                 raise HTTPException(status_code=404, detail="Ketua Tim tidak ditemukan.")
             db_team.users.append(ketua_user)
+
+    if "operator_ids" in update_data:
+        new_operator_ids = set(update_data.pop('operator_ids', []))
+
+        # 1. Hapus semua peran 'operator' yang ada untuk tim ini
+        db.execute(
+            update(models.user_team_link)
+            .where(models.user_team_link.c.team_id == team_id)
+            .values(team_role='member')
+        )
+
+        # 2. Tetapkan peran 'operator' untuk user yang baru dipilih
+        if new_operator_ids:
+            db.execute(
+                update(models.user_team_link)
+                .where(
+                    models.user_team_link.c.team_id == team_id,
+                    models.user_team_link.c.user_id.in_(new_operator_ids)
+                )
+                .values(team_role='operator')
+            )
 
     # Update field lain
     for key, value in update_data.items():
@@ -530,28 +654,45 @@ def remove_team_member(team_id: int, user_id: int, db: Session = Depends(databas
 @app.get("/api/teams/{team_id}/details", response_model=schemas.TeamDetail, response_model_by_alias=True)
 def get_team_details_with_activities(team_id: int, db: Session = Depends(database.get_db)):
     """
-    Mengambil detail satu tim, termasuk proyek (dengan aktivitas di dalamnya), anggota, dan ketua.
+    Mengambil detail satu tim, termasuk proyek, anggota (DENGAN PERAN), dan ketua.
     """
     db_team = db.query(models.Team).options(
         joinedload(models.Team.ketua_tim).joinedload(models.User.jabatan),
         joinedload(models.Team.users).joinedload(models.User.jabatan),
-        
-        # Eager load projects dan nested activities di dalamnya
-        joinedload(models.Team.projects).joinedload(models.Project.aktivitas).joinedload(models.Aktivitas.users)
-        
+        joinedload(models.Team.projects).options(
+            joinedload(models.Project.project_leader),
+            joinedload(models.Project.aktivitas).joinedload(models.Aktivitas.users)
+        )
     ).filter(models.Team.id == team_id).first()
     
     if not db_team:
         raise HTTPException(status_code=404, detail="Tim tidak ditemukan")
 
-    # Opsional: Urutkan aktivitas di dalam setiap proyek
+    # --- PENDEKATAN FINAL YANG BENAR ---
+    # Tambahkan atribut 'peran' secara dinamis ke setiap objek user SQLAlchemy
+    # sebelum Pydantic melakukan validasi dan konversi.
+    if db_team.users:
+        for user in db_team.users:
+            link = db.query(models.user_team_link).filter(
+                models.user_team_link.c.user_id == user.id,
+                models.user_team_link.c.team_id == team_id
+            ).first()
+            
+            # Menambahkan atribut sementara ke objek model SQLAlchemy
+            setattr(user, 'peran', link.team_role if link else 'member')
+    # --- AKHIR PENDEKATAN FINAL ---
+
+    # Logika sorting aktivitas tetap sama
     for project in db_team.projects:
-        project.aktivitas = sorted(project.aktivitas, key=lambda a: a.tanggal_mulai if a.tanggal_mulai else date.min)
+        project.aktivitas = sorted(
+            project.aktivitas, 
+            key=lambda a: a.tanggal_mulai if a.tanggal_mulai else date.min, 
+            reverse=True
+        )
     
-    # Hapus properti aktivitas yang ada di level tim
-    # Karena kita akan menampilkan aktivitas per proyek
     db_team.aktivitas = []
     
+    # Kembalikan objek SQLAlchemy. Pydantic akan menanganinya dengan benar sekarang.
     return db_team
 
 @app.get("/api/teams/{team_id}/aktivitas", response_model=List[schemas.Aktivitas])
@@ -626,7 +767,28 @@ def get_aktivitas_trend(
 # ===================================================================
 
 @app.post("/api/projects", response_model=schemas.Project, response_model_by_alias=True)
-def create_project(project: schemas.ProjectCreate, db: Session = Depends(database.get_db)):
+def create_project(project: schemas.ProjectCreate, db: Session = Depends(database.get_db), current_user: models.User = Depends(security.get_current_user)):
+    
+    team = db.query(models.Team).filter(models.Team.id == project.team_id).first()
+    if not team:
+        raise HTTPException(status_code=404, detail="Tim tidak ditemukan")
+
+    # --- LOGIKA OTORISASI BARU ---
+    is_ketua_tim = team.ketua_tim_id == current_user.id
+    
+    is_operator_query = select(models.user_team_link).where(
+        models.user_team_link.c.user_id == current_user.id,
+        models.user_team_link.c.team_id == project.team_id,
+        models.user_team_link.c.team_role == 'operator'
+    )
+    is_operator = db.execute(is_operator_query).first() is not None
+
+    if not is_ketua_tim and not is_operator:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, 
+            detail="Anda bukan Ketua Tim atau Operator untuk membuat proyek di tim ini"
+        )
+    
     project_data = project.dict(by_alias=False)
     db_project = models.Project(**project_data)
     db.add(db_project)
@@ -792,12 +954,25 @@ def get_all_aktivitas(
     skip: int = 0,
     limit: int = 10,
     q: Optional[str] = None,
-    current_user: models.User = Depends(security.get_current_user)
+    current_user: models.User = Depends(security.get_current_user),
+    user_scope: str = 'me',
+    month: Optional[int] = None,
+    year: Optional[int] = None
 ):
     query = db.query(models.Aktivitas).options(
         joinedload(models.Aktivitas.creator),
         joinedload(models.Aktivitas.team)
     )
+
+    # Filter berdasarkan scope (Aktivitas saya / Semua)
+    if user_scope == 'me':
+        query = query.filter(models.Aktivitas.users.any(id=current_user.id))
+
+    # Filter berdasarkan bulan dan tahun
+    if month:
+        query = query.filter(extract('month', models.Aktivitas.tanggal_mulai) == month)
+    if year:
+        query = query.filter(extract('year', models.Aktivitas.tanggal_mulai) == year)
 
     # Jika ada parameter pencarian 'q'
     if q:
@@ -853,7 +1028,31 @@ def get_aktivitas_kepala(
         models.Aktivitas.tanggal_mulai.asc()
     )
     return query.all()
+
+@app.get("/api/public/aktivitas/{public_id}", response_model=schemas.Aktivitas)
+def get_public_aktivitas_detail(
+    public_id: uuid.UUID,
+    db: Session = Depends(database.get_db)
+):
+    """
+    Endpoint publik untuk mengambil detail aktivitas menggunakan public_id (UUID).
+    Tidak memerlukan otentikasi.
+    """
+    # Query aktivitas berdasarkan public_id
+    aktivitas = db.query(models.Aktivitas).options(
+        # Load semua relasi yang ingin Anda tampilkan di halaman publik
+        joinedload(models.Aktivitas.project),
+        joinedload(models.Aktivitas.team),
+        joinedload(models.Aktivitas.users).joinedload(models.User.jabatan), # Load anggota & jabatan
+        joinedload(models.Aktivitas.dokumen)
+    ).filter(models.Aktivitas.public_id == public_id).first()
+
+    if not aktivitas:
+        raise HTTPException(status_code=404, detail="Aktivitas tidak ditemukan")
     
+    # Skema 'schemas.Aktivitas' Anda akan digunakan untuk merespons
+    return aktivitas
+  
 @app.post("/api/aktivitas", response_model=schemas.Aktivitas)
 def create_aktivitas(
     aktivitas: schemas.AktivitasCreate, 
@@ -945,12 +1144,73 @@ def create_aktivitas(
     print("--- Proses selesai ---")
     return db_aktivitas
 
+@app.get("/api/aktivitas/download-excel", response_class=StreamingResponse)
+def download_aktivitas_excel(
+    db: Session =Depends(database.get_db),
+    current_user: models.User = Depends(security.get_current_user),
+    user_scope: str = 'me',
+    month: Optional[int] = None,
+    year: Optional[int] = None
+):
+    query = db.query(models.Aktivitas).options(
+        joinedload(models.Aktivitas.project),
+        joinedload(models.Aktivitas.team)
+    )
+
+    if user_scope == 'me': 
+        query = query.filter(models.Aktivitas.users.any(id=current_user.id))
+
+    if month:
+        query = query.filter(extract('month', models.Aktivitas.tanggal_mulai) == month)
+    if year:
+        query = query.filter(extract('year', models.Aktivitas.tanggal_mulai) == year)
+
+    # Ambil semua data yang cocok (tanpa pagination)
+    aktivitas_list = query.order_by(models.Aktivitas.tanggal_mulai.desc()).all()
+
+    # Buat File Excel di Memori
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Daftar Aktivitas"
+    
+    # Buat Header
+    headers = ["Nama Aktivitas", "Nama Proyek", "Tim", "Bukti Dukung (Link)"]
+    ws.append(headers)
+
+    # 3. Isi Data
+    base_url = "https://sinergi.statsntb.id" # URL frontend Anda
+    for aktivitas in aktivitas_list:
+        # Menggunakan nama relasi dari model Anda
+        project_name = aktivitas.project.nama_project if aktivitas.project else "N/A"
+        team_name = aktivitas.team.nama_tim if aktivitas.team else "N/A"
+        link = f"{base_url}/public/aktivitas/{aktivitas.public_id}"
+        
+        ws.append([
+            aktivitas.nama_aktivitas,
+            project_name,
+            team_name,
+            link
+        ])
+
+    # Simpan ke stream (buffer)
+    stream = io.BytesIO()
+    wb.save(stream)
+    stream.seek(0) # Pindahkan kursor ke awal file
+
+    # 5. Kembalikan sebagai file download
+    filename = f"aktivitas_{user_scope}_{year}_{month}.xlsx" if month and year else f"aktivitas_{user_scope}.xlsx"
+    return StreamingResponse(
+        stream, 
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
 # --- ENDPOINT MENGAMBIL DETAIL AKTIVITAS ---
 @app.get("/api/aktivitas/{aktivitas_id}", response_model=schemas.Aktivitas)
 def get_aktivitas_by_id(aktivitas_id: int, db: Session = Depends(database.get_db)):
     # Query database untuk mencari aktivitas dengan ID yang sesuai
     db_aktivitas = db.query(models.Aktivitas).options(
-        joinedload(models.Aktivitas.dokumen),
+        joinedload(models.Aktivitas.dokumen),   
         joinedload(models.Aktivitas.daftar_dokumen_wajib)
     ).filter(models.Aktivitas.id == aktivitas_id).first()
     
