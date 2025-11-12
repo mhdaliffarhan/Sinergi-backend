@@ -126,7 +126,14 @@ class UserBase(CamelModel):
     username: str
     nama_lengkap: Optional[str] = None
     foto_profil_url: Optional[str] = None
-
+    nip: Optional[str] = None
+    nipbps: Optional[str] = None
+    gol_akhir: Optional[str] = None
+    tmt_gol: Optional[date] = None
+    tmt_jab: Optional[date] = None
+    status_kepegawaian: Optional[str] = None
+    jenis_kelamin: Optional[str] = None
+    nohp: Optional[str] = None
 
 class UserCreate(UserBase):
     password: str
@@ -169,7 +176,7 @@ class UserWithTeams(UserBase):
     aktivitas: List[AktivitasInUser] = [] 
 
 
-class UserUpdate(CamelModel):
+class UserUpdate(UserBase):
     nama_lengkap: Optional[str] = None
     sistem_role_id: Optional[int] = None
     jabatan_id: Optional[int] = None
@@ -197,6 +204,9 @@ class UserPage(CamelModel):
     total: int
     items: List[User]
 
+class ProfileUpdate(CamelModel):
+    nama_lengkap: Optional[str] = None
+    nohp: Optional[str] = None
 
 # ===================================================================
 # SKEMA UNTUK TEAM

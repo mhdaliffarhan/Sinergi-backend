@@ -109,6 +109,24 @@ class User(Base):
     sistem_role_id = Column(Integer, ForeignKey("sistem_roles.id"))
     jabatan_id = Column(Integer, ForeignKey("jabatan.id"))
     foto_profil_url = Column(Text, nullable=True) 
+    nip = Column(String(18), nullable= True, unique=True, index=True)
+    nipbps = Column(String(9), nullable=True, unique=True, index=True)
+
+    # Info Pangkat/Golongan
+    gol_akhir = Column(String(10), nullable=True)
+    tmt_gol = Column(DATE, nullable=True) # TMT Golongan
+
+    # Info Jabatan (TMT)
+    tmt_jab = Column(DATE, nullable=True) # TMT Jabatan
+
+    # Info Lainnya
+    status_kepegawaian = Column(String(50), nullable=True) # Misal: PNS, PPNPN
+    jenis_kelamin = Column(String(20), nullable=True) # Misal: Laki-laki, Perempuan
+
+    # Info Kontak (untuk WA)
+    nohp = Column(String(20), nullable=True, unique=True, index=True)
+
+    
     sistem_role = relationship("SistemRole")
     jabatan = relationship("Jabatan")
     teams = relationship("Team", secondary=user_team_link, back_populates="users")

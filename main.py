@@ -1,5 +1,5 @@
 from fastapi import (FastAPI, Depends, HTTPException, status, Response, File,
-                     UploadFile, Form, Query)
+                     UploadFile, Form, Query, BackgroundTasks)
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy import or_, desc, and_, func, insert, select, update, extract
@@ -10,8 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from datetime import timedelta, date, datetime
 from openpyxl import Workbook
 
-import models, database, schemas, security, uuid, io
-import os, shutil, uuid, io, zipfile
+import models, database, schemas, security, uuid, io, os, shutil, uuid, io, zipfile, services_wa
 
 # ===================================================================
 # INISIALISASI & KONFIGURASI
@@ -109,9 +108,18 @@ def create_notification(
     title: str,
     massage: str,
     link_to: str,
+    background_tasks: BackgroundTasks,
     activity_id: Optional[int] = None,
-    project_id: Optional[int] = None
+    project_id: Optional[int] = None,
+    send_whatsapp: bool = True,
+    wa_message_override: Optional[str] = None
 ):
+    """
+    Membuat notifikasi di DB. Jika send_whatsapp=True dan user memiliki 'nohp',
+    akan mengirim notifikasi WA.
+    'wa_message_override' akan digunakan sebagai isi pesan WA jika tersedia.
+    Jika tidak, 'title' dan 'massage' akan digunakan.
+    """
     db_notif = models.Notifikasi(
         user_id=user_id,
         title=title,
@@ -123,6 +131,33 @@ def create_notification(
     )
     db.add(db_notif)
 
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+
+    # Kirim HANYA jika user punya nohp DAN send_whatsapp=True
+    if user and user.nohp and send_whatsapp:
+
+        base_url = "https://sinergi.statsntb.id" 
+        full_link = f"{base_url}{link_to}"
+        wa_message = ""
+
+        if wa_message_override:
+            # GUNAKAN PESAN KUSTOM (jika ada)
+            # Kita gunakan placeholder {LINK} agar bisa diganti
+            wa_message = wa_message_override.replace("{LINK}", full_link)
+        else:
+            # GUNAKAN FORMAT LAMA (default)
+            wa_message = f"🔔 *Notifikasi SINERGI*\n\n"
+            wa_message += f"*{title}*\n"
+            wa_message += f"{massage}\n\n"
+            wa_message += f"Lihat detail:\n{full_link}"
+
+        # Jalankan di background
+        background_tasks.add_task(
+            services_wa.send_whatsapp_message,
+            phone_number=user.nohp,
+            message=wa_message
+        )
+    
     return db_notif
 
 
@@ -180,7 +215,15 @@ def read_users_me(current_user: models.User = Depends(security.get_current_user)
         "is_active": current_user.is_active,
         "sistem_role": current_user.sistem_role,
         "jabatan": current_user.jabatan,
-        
+        "nip": current_user.nip,
+        "nipbps": current_user.nipbps,
+        "gol_akhir": current_user.gol_akhir,
+        "tmt_gol": current_user.tmt_gol,
+        "tmt_jab": current_user.tmt_jab,
+        "status_kepegawaian": current_user.status_kepegawaian,
+        "jenis_kelamin": current_user.jenis_kelamin,
+        "nohp": current_user.nohp,
+
         # Data relasi lain yang dibutuhkan oleh skema UserWithTeams
         "created_projects": current_user.created_projects,
         "aktivitas": current_user.aktivitas,
@@ -264,6 +307,75 @@ def update_password(
 
     return {"message": "Password berhasil diperbarui"}
 
+@app.put("/api/users/me/profile", response_model=schemas.User)
+def update_own_profile(
+    profile_data: schemas.ProfileUpdate,
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(security.get_current_user)
+):
+    """
+    Mengizinkan pengguna yang sedang login untuk memperbarui
+    nama_lengkap dan nohp mereka sendiri.
+    """
+    
+    # Ambil data dari payload
+    update_data = profile_data.dict(exclude_unset=True)
+    
+    # Update field di objek user
+    for key, value in update_data.items():
+        if hasattr(current_user, key):
+            setattr(current_user, key, value)
+        
+    db.commit()
+    db.refresh(current_user)
+    
+    # Kita harus return dict manual karena 'teams'
+    # (Salin dari read_users_me)
+    teams_with_role = []
+    user_teams_links = db.query(
+        models.Team, 
+        models.user_team_link.c.team_role
+    ).join(
+        models.user_team_link, models.user_team_link.c.team_id == models.Team.id
+    ).filter(
+        models.user_team_link.c.user_id == current_user.id
+    ).all()
+
+    for team, role in user_teams_links:
+        teams_with_role.append({
+            "id": team.id,
+            "nama_tim": team.nama_tim,
+            "peran": role
+        })
+    
+    ketua_tim_aktif_list = db.query(models.Team).filter(models.Team.ketua_tim_id == current_user.id).all()
+    is_ketua = len(ketua_tim_aktif_list) > 0
+
+    response_data = {
+        "id": current_user.id,
+        "username": current_user.username,
+        "nama_lengkap": current_user.nama_lengkap,
+        "foto_profil_url": current_user.foto_profil_url,
+        "is_active": current_user.is_active,
+        "sistem_role": current_user.sistem_role,
+        "jabatan": current_user.jabatan,
+        "nip": current_user.nip,
+        "nipbps": current_user.nipbps,
+        "gol_akhir": current_user.gol_akhir,
+        "tmt_gol": current_user.tmt_gol,
+        "tmt_jab": current_user.tmt_jab,
+        "status_kepegawaian": current_user.status_kepegawaian,
+        "jenis_kelamin": current_user.jenis_kelamin,
+        "nohp": current_user.nohp, # <-- data ini akan ter-update
+        "created_projects": current_user.created_projects,
+        "aktivitas": current_user.aktivitas,
+        "teams": teams_with_role,
+        "is_ketua_tim": is_ketua,
+        "ketua_tim_aktif": ketua_tim_aktif_list,
+    }
+    
+    return response_data
+
 # ===================================================================
 # ENDPOINT MANAJEMEN ADMIN
 # ===================================================================
@@ -275,13 +387,23 @@ def create_user(user: schemas.UserCreate, db: Session = Depends(database.get_db)
     
     hashed_password = security.get_password_hash(user.password)
     
+    new_user_data = user.dict()
+
+    new_user_data.pop('password', None)
+
     new_user = models.User(
-        username=user.username,
-        hashed_password=hashed_password,
-        nama_lengkap=user.nama_lengkap,
-        sistem_role_id=user.sistem_role_id,
-        jabatan_id=user.jabatan_id
+        **new_user_data,
+        hashed_password=hashed_password
     )
+
+    # new_user = models.User(
+    #     username=user.username,
+    #     hashed_password=hashed_password,
+    #     nama_lengkap=user.nama_lengkap,
+    #     sistem_role_id=user.sistem_role_id,
+    #     jabatan_id=user.jabatan_id
+    # )
+
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
@@ -330,8 +452,7 @@ def get_all_users(
                 "nama_tim": team.nama_tim,
                 "peran": role
             })
-        
-        # Buat dictionary yang sesuai dengan skema User
+
         user_dict = {
             "id": user.id,
             "username": user.username,
@@ -342,7 +463,16 @@ def get_all_users(
             "jabatan": user.jabatan,
             "created_projects": user.created_projects,
             "aktivitas": user.aktivitas,
-            "teams": teams_with_role # Gunakan data yang sudah diproses
+            "teams": teams_with_role,
+
+            "nip": user.nip,
+            "nipbps": user.nipbps,
+            "gol_akhir": user.gol_akhir,
+            "tmt_gol": user.tmt_gol,
+            "tmt_jab": user.tmt_jab,
+            "status_kepegawaian": user.status_kepegawaian,
+            "jenis_kelamin": user.jenis_kelamin,
+            "nohp": user.nohp
         }
         processed_users.append(user_dict)
 
@@ -367,7 +497,49 @@ def update_user(user_id: int, user_update: schemas.UserUpdate, db: Session = Dep
     db.commit()
     db.refresh(db_user)
     
-    return db_user
+    teams_with_role = []
+    user_teams_links = db.query(
+        models.Team, 
+        models.user_team_link.c.team_role
+    ).join(
+        models.user_team_link, models.user_team_link.c.team_id == models.Team.id
+    ).filter(
+        models.user_team_link.c.user_id == db_user.id # Gunakan db_user.id
+    ).all()
+
+    for team, role in user_teams_links:
+        teams_with_role.append({
+            "id": team.id,
+            "nama_tim": team.nama_tim,
+            "peran": role
+        })
+
+    # Buat kamus respons manual, sama seperti di get_all_users
+    # Ini memastikan semua field baru (nip, nohp) dan teams (dengan peran) disertakan
+    user_dict = {
+        "id": db_user.id,
+        "username": db_user.username,
+        "nama_lengkap": db_user.nama_lengkap,
+        "foto_profil_url": db_user.foto_profil_url,
+        "is_active": db_user.is_active,
+        "sistem_role": db_user.sistem_role,
+        "jabatan": db_user.jabatan,
+        "created_projects": db_user.created_projects,
+        "aktivitas": db_user.aktivitas,
+        "teams": teams_with_role, # <-- Menggunakan list dict yang sudah benar
+        
+        # Data baru
+        "nip": db_user.nip,
+        "nipbps": db_user.nipbps,
+        "gol_akhir": db_user.gol_akhir,
+        "tmt_gol": db_user.tmt_gol,
+        "tmt_jab": db_user.tmt_jab,
+        "status_kepegawaian": db_user.status_kepegawaian,
+        "jenis_kelamin": db_user.jenis_kelamin,
+        "nohp": db_user.nohp
+    }
+
+    return user_dict
 
 # --- ENDPOINT UNTUK MENGHAPUS USER ---
 @app.delete("/api/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(security.require_role(["Superadmin"]))])
@@ -577,7 +749,7 @@ def get_team_details(team_id: int, db: Session = Depends(database.get_db)):
     return db_team
 
 @app.post("/api/teams/{team_id}/members", response_model=schemas.Team, response_model_by_alias=True, dependencies=[Depends(security.require_role(["Superadmin", "Admin" ]))])
-def add_team_member(team_id: int, user_id: int, db: Session = Depends(database.get_db)):
+def add_team_member(team_id: int, user_id: int, background_tasks: BackgroundTasks, db: Session = Depends(database.get_db)):
     """Menambahkan seorang pengguna ke dalam tim."""
     db_team = db.query(models.Team).filter(models.Team.id == team_id).first()
     db_user = db.query(models.User).filter(models.User.id == user_id).first()
@@ -605,7 +777,8 @@ def add_team_member(team_id: int, user_id: int, db: Session = Depends(database.g
             user_id=user_id, 
             title=title_notif, 
             massage=message_notif, 
-            link_to=link_detail
+            link_to=link_detail,
+            background_tasks=background_tasks
         )
         db.commit() # Commit notifikasi ke database
         # --- END LOGIKA NOTIFIKASI ---
@@ -615,7 +788,7 @@ def add_team_member(team_id: int, user_id: int, db: Session = Depends(database.g
     return db_team
 
 @app.delete("/api/teams/{team_id}/members/{user_id}", response_model=schemas.Team, response_model_by_alias=True, dependencies=[Depends(security.require_role(["Superadmin", "Admin"]))])
-def remove_team_member(team_id: int, user_id: int, db: Session = Depends(database.get_db)):
+def remove_team_member(team_id: int, user_id: int, background_tasks: BackgroundTasks, db: Session = Depends(database.get_db)):
     """Mengeluarkan seorang pengguna dari tim."""
     db_team = db.query(models.Team).filter(models.Team.id == team_id).first()
     db_user = db.query(models.User).filter(models.User.id == user_id).first()
@@ -643,7 +816,8 @@ def remove_team_member(team_id: int, user_id: int, db: Session = Depends(databas
         user_id=user_id, 
         title=title_notif, 
         massage=message_notif, 
-        link_to="/team" 
+        link_to="/team" ,
+        background_tasks=background_tasks
     )
     db.commit() # Commit notifikasi
     # --- END LOGIKA NOTIFIKASI ---
@@ -767,7 +941,7 @@ def get_aktivitas_trend(
 # ===================================================================
 
 @app.post("/api/projects", response_model=schemas.Project, response_model_by_alias=True)
-def create_project(project: schemas.ProjectCreate, db: Session = Depends(database.get_db), current_user: models.User = Depends(security.get_current_user)):
+def create_project(project: schemas.ProjectCreate, background_tasks: BackgroundTasks, db: Session = Depends(database.get_db), current_user: models.User = Depends(security.get_current_user)):
     
     team = db.query(models.Team).filter(models.Team.id == project.team_id).first()
     if not team:
@@ -826,6 +1000,7 @@ def create_project(project: schemas.ProjectCreate, db: Session = Depends(databas
                 title=title_leader, 
                 massage=message_leader, 
                 link_to=link_detail, 
+                background_tasks=background_tasks,
                 project_id=db_project.id
             )
         else:
@@ -836,6 +1011,7 @@ def create_project(project: schemas.ProjectCreate, db: Session = Depends(databas
                 title=title_umum, 
                 massage=message_umum, 
                 link_to=link_detail, 
+                background_tasks=background_tasks,
                 project_id=db_project.id
             )
             
@@ -1055,9 +1231,10 @@ def get_public_aktivitas_detail(
   
 @app.post("/api/aktivitas", response_model=schemas.Aktivitas)
 def create_aktivitas(
-    aktivitas: schemas.AktivitasCreate, 
+    aktivitas: schemas.AktivitasCreate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(database.get_db),
-    current_user: models.User = Depends(security.get_current_user)
+    current_user: models.User = Depends(security.get_current_user),
 ):
     print("--- Memulai proses pembuatan aktivitas ---")
     print(f"Data payload yang diterima: {aktivitas.dict()}")
@@ -1109,33 +1286,84 @@ def create_aktivitas(
     
     # LOGIKA PENGIRIMAN NOTIFIKASI
     if db_aktivitas.users:
-        # Muat relasi Team dan Project yang baru dibuat untuk mendapatkan Nama Tim, Project
+        # Muat relasi Team dan Project
         aktivitas_with_relations = db.query(models.Aktivitas).options(
             joinedload(models.Aktivitas.team),
-            joinedload(models.Aktivitas.project)
+            joinedload(models.Aktivitas.project) # <-- Ini sudah ada
         ).filter(models.Aktivitas.id == db_aktivitas.id).first()
 
+        # --- KUMPULKAN INFO UNTUK WA ---
+        
         nama_aktivitas = aktivitas_with_relations.nama_aktivitas
         nama_tim = aktivitas_with_relations.team.nama_tim if aktivitas_with_relations.team else "Tim Tidak Diketahui"
-        tanggal_mulai_str = aktivitas_with_relations.tanggal_mulai.strftime("%d %B %Y")
-        link_detail = f"/aktivitas/detail/{db_aktivitas.id}"
         
+        # V TAMBAHKAN NAMA PROYEK V
+        nama_project = aktivitas_with_relations.project.nama_project if aktivitas_with_relations.project else "Tanpa Proyek"
+        # ^ AKHIR BLOK TAMBAHAN ^
+        
+        link_detail = f"/aktivitas/detail/{db_aktivitas.id}"
+
+        # 1. Format String Pelaksanaan (Tanggal)
+        pelaksanaan_str = ""
+        tgl_mulai = aktivitas_with_relations.tanggal_mulai
+        tgl_selesai = aktivitas_with_relations.tanggal_selesai
+        
+        if tgl_mulai:
+            pelaksanaan_str = f"🗓️ {tgl_mulai.strftime('%d %B %Y')}"
+            if tgl_selesai and tgl_selesai != tgl_mulai:
+                pelaksanaan_str += f" - {tgl_selesai.strftime('%d %B %Y')}"
+        else:
+            pelaksanaan_str = "🗓️ Tanggal belum ditentukan"
+
+        # 2. Format String Pelaksanaan (Waktu)
+        jam_mulai = aktivitas_with_relations.jam_mulai
+        jam_selesai = aktivitas_with_relations.jam_selesai
+        
+        if jam_mulai:
+            jam_str = f"⏰ {jam_mulai.strftime('%H.%M')}"
+            if jam_selesai:
+                jam_str += f" - {jam_selesai.strftime('%H.%M')} WITA"
+            else:
+                jam_str += " WITA"
+            pelaksanaan_str += f"\n{jam_str}"
+        
+        # --- AKHIR INFO WA ---
+
         # Kirim notifikasi ke setiap pengguna yang terlibat
         for user in db_aktivitas.users:
-            title = f"Anda ditambahkan ke Aktivitas: {nama_aktivitas}"
-            massage = f"Aktivitas ini di bawah tim '{nama_tim}' dan dijadwalkan mulai {tanggal_mulai_str}."
+            
+            # --- PERBAIKAN: Template WA yang Disempurnakan ---
+            wa_msg_template = (
+                f"🔔 *Notifikasi SINERGI: Aktivitas Baru*\n\n"
+                f"Halo {user.nama_lengkap}!\n"
+                f"Anda telah ditambahkan ke aktivitas baru:\n\n"
+                f"👥 *Tim*:\n{nama_tim}\n\n"
+                f"💼 *Project*:\n{nama_project}\n\n" 
+                f"📝 *Nama Aktivitas*:\n{nama_aktivitas}\n\n"
+                f"*Pelaksanaan*:\n{pelaksanaan_str}\n\n"
+                f"Lihat Detail:\n"
+                f"{{LINK}}\n\n"  # Placeholder
+                f"Aplikasi Sinergi\n" # <-- Menambahkan footer
+                f"BPS Provinsi Nusa Tenggara Barat"
+            )
+            
+            # Pesan In-App (Singkat)
+            app_title = f"Aktivitas Baru: {nama_aktivitas}"
+            app_massage = f"Anda ditambahkan ke aktivitas ini oleh {current_user.nama_lengkap}."
             
             create_notification(
                 db, 
                 user_id=user.id, 
-                title=title, 
-                massage=massage, 
-                link_to=link_detail, 
+                title=app_title,
+                massage=app_massage,
+                link_to=link_detail,
+                background_tasks=background_tasks,
                 activity_id=db_aktivitas.id, 
-                project_id=db_aktivitas.project_id
+                project_id=db_aktivitas.project_id,
+                send_whatsapp=True,
+                wa_message_override=wa_msg_template # <-- Mengirim template kustom
             )
         
-        # Commit notifikasi di akhir
         db.commit()
     # END: LOGIKA PENGIRIMAN NOTIFIKASI
 
@@ -1302,6 +1530,7 @@ def update_aktivitas(
 @app.delete("/api/aktivitas/{aktivitas_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_aktivitas(
     aktivitas_id: int, 
+    background_tasks: BackgroundTasks,
     db: Session = Depends(database.get_db),
     current_user: models.User = Depends(security.get_current_user)
 ):
@@ -1323,7 +1552,7 @@ def delete_aktivitas(
     if users_terlibat:
         title_notif = f"Aktivitas Dihapus: {nama_aktivitas}"
         message_notif = (
-            f"Aktivitas '{nama_aktivitas}' telah dihapus oleh {current_user.nama_lengkap}. "
+            f"Aktivitas '{nama_aktivitas}' telah dihapus. "
             "Semua data terkait telah dihilangkan."
         )
         
@@ -1334,9 +1563,10 @@ def delete_aktivitas(
                 user_id=user.id, 
                 title=title_notif, 
                 massage=message_notif, 
-                # Tidak ada link karena aktivitas sudah hilang
+                background_tasks=background_tasks,
                 link_to="/dashboard", 
-                activity_id=None # Tidak ada activity_id yang relevan
+                activity_id=None,
+                send_whatsapp=False
             )
         db.commit() # Commit notifikasi
     # --- END LOGIKA NOTIFIKASI ---
@@ -1602,6 +1832,7 @@ def delete_dokumen(dokumen_id: int, db: Session = Depends(database.get_db)):
 def update_status_pengecekan(
     item_id: int,
     status_update: schemas.StatusPengecekanUpdate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(database.get_db),
     current_user: models.User = Depends(security.get_current_user)
 ):
@@ -1636,7 +1867,7 @@ def update_status_pengecekan(
     db_item.status_pengecekan = status_update.status_pengecekan
     db.commit()
 
-    # --- LOGIKA NOTIFIKASI BARU (Feedback Kritis) ---
+    # --- LOGIKA NOTIFIKASI ---
     if old_status != new_status and db_item.dokumen_id:
         
         # A. Tentukan Konten Notifikasi
@@ -1659,11 +1890,13 @@ def update_status_pengecekan(
                     db,
                     user_id=user.id,
                     title=title_notif,
-                    massage=message_notif, # Menggunakan 'massage' sesuai model DB
+                    massage=message_notif,
+                    background_tasks=background_tasks,
                     link_to=link_detail,
-                    activity_id=db_item.aktivitas_id
+                    activity_id=db_item.aktivitas_id,
+                    send_whatsapp=False
                 )
-            db.commit() # Commit notifikasi
+            db.commit()
             
     # --- END LOGIKA NOTIFIKASI ---
 
