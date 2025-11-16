@@ -1,6 +1,8 @@
 from __future__ import annotations
 from uuid import UUID
 
+import re
+
 from pydantic import BaseModel, model_validator, field_validator, Field, ConfigDict
 from typing import Optional, Any, List
 from datetime import date, time, datetime
@@ -11,6 +13,26 @@ def to_camel(snake_str: str) -> str:
     parts = snake_str.split('_')
     return parts[0] + "".join(word.capitalize() for word in parts[1:])
 
+def validate_phone_number(nohp: Optional[str]) -> Optional[str]:
+    """Helper untuk membersihkan dan memvalidasi nomor HP."""
+    if not nohp:
+        return None
+
+    # 1. Hapus semua karakter non-numerik (spasi, -, +)
+    nohp_numeric = "".join(filter(str.isdigit, nohp.strip()))
+
+    # 2. Jika diawali 08, ganti ke 628
+    if nohp_numeric.startswith('08'):
+        nohp_numeric = '62' + nohp_numeric[1:]
+
+    # 3. Cek Aturan: Harus '62' dan 12-14 digit total
+    # (62 + 10-12 digit sisa = 12-14 total)
+    if not re.match(r"^62\d{9,12}$", nohp_numeric):
+         raise ValueError(
+            "Nomor HP harus diawali 62 dan memiliki 12-14 digit (misal: 62812...)"
+         )
+
+    return nohp_numeric
 
 # Model dasar yang akan melakukan konversi otomatis untuk SEMUA skema
 class CamelModel(BaseModel):
@@ -135,6 +157,39 @@ class UserBase(CamelModel):
     jenis_kelamin: Optional[str] = None
     nohp: Optional[str] = None
 
+    class Config:
+        from_attributes = True
+
+    # V TAMBAHKAN BLOK VALIDATOR INI V
+
+    @field_validator('nip')
+    @classmethod
+    def validate_nip(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or v == "":
+            return None
+
+        nip_numeric = "".join(filter(str.isdigit, v))
+        if len(nip_numeric) != 18:
+            raise ValueError("NIP harus 18 digit angka.")
+        return nip_numeric
+
+    @field_validator('nipbps')
+    @classmethod
+    def validate_nipbps(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or v == "":
+            return None
+
+        nip_numeric = "".join(filter(str.isdigit, v))
+        if len(nip_numeric) != 9: 
+            raise ValueError("NIP BPS harus 9 digit angka.")
+        return nip_numeric 
+
+    @field_validator('nohp')
+    @classmethod
+    def validate_nohp(cls, v: Optional[str]) -> Optional[str]:
+        # Memanggil helper yang kita buat di atas
+        return validate_phone_number(v)
+    
 class UserCreate(UserBase):
     password: str
     sistem_role_id: int
@@ -207,6 +262,18 @@ class UserPage(CamelModel):
 class ProfileUpdate(CamelModel):
     nama_lengkap: Optional[str] = None
     nohp: Optional[str] = None
+
+    @field_validator('nohp')
+    @classmethod
+    def validate_nohp_profile(cls, v: Optional[str]) -> Optional[str]:
+        return validate_phone_number(v)
+
+class ForgotPasswordRequest(CamelModel):
+    username: str
+
+class ResetPasswordRequest(CamelModel):
+    token: str
+    new_password: str
 
 # ===================================================================
 # SKEMA UNTUK TEAM

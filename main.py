@@ -1,5 +1,5 @@
 from fastapi import (FastAPI, Depends, HTTPException, status, Response, File,
-                     UploadFile, Form, Query, BackgroundTasks)
+                     UploadFile, Form, Query, BackgroundTasks, Body)
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy import or_, desc, and_, func, insert, select, update, extract
@@ -9,8 +9,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from datetime import timedelta, date, datetime
 from openpyxl import Workbook
+from jose import JWSError, jwt
+from pydantic import BaseModel
 
-import models, database, schemas, security, uuid, io, os, shutil, uuid, io, zipfile, services_wa
+import models, database, schemas, security, uuid, io, os, shutil, uuid, io, zipfile, services_wa, asyncio
 
 # ===================================================================
 # INISIALISASI & KONFIGURASI
@@ -168,14 +170,103 @@ def create_notification(
 def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(database.get_db)):
     user = security.get_user(db, username=form_data.username)
     if not user or not security.verify_password(form_data.password, user.hashed_password):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Username atau password salah")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, 
+            detail="Username atau password salah",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     
-    token = security.create_access_token(data={"sub": user.username})
-    content = {"accessToken": token, "tokenType": "bearer"}
-    return JSONResponse(content=content)
+    # Akses Token (30 Menit)
+    access_token_expires = timedelta(minutes=security.ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = security.create_access_token(
+        data={"sub": user.username}, expires_delta=access_token_expires
+    )
 
-# Di dalam file main.py
+    # Refresh Token (30 Hari)
+    refresh_token_expires = timedelta(days=security.REFRESH_TOKEN_EXPIRE_DAYS)
+    refresh_token = security.create_refresh_token(
+        data={"sub": user.username}, expires_delta=refresh_token_expires
+    )
 
+    return {
+        "accessToken" : access_token,
+        "refreshToken" : refresh_token,
+        "tokenType": "bearer"
+    }
+
+async def get_current_user_from_refresh_token(
+    token: str = Depends(security.oauth2_scheme), # Asumsi Anda punya oauth2_scheme
+    db: Session = Depends(database.get_db)
+):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate refresh token",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, security.SECRET_KEY, algorithms=[security.ALGORITHM])
+        username: str = payload.get("sub")
+
+        # Pastikan ini adalah refresh token
+        if payload.get("token_type") != "refresh":
+            raise credentials_exception
+        if username is None:
+            raise credentials_exception
+
+    except JWTError:
+        raise credentials_exception
+
+    user = security.get_user(db, username=username)
+    if user is None:
+        raise credentials_exception
+    return user
+
+# (Ini mirip dengan 'get_current_user_from_refresh_token', tapi untuk 'reset')
+async def get_user_from_reset_token(
+    token: str = Body(..., embed=True), # Ambil token dari body
+    db: Session = Depends(database.get_db)
+):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Token reset tidak valid or kedaluwarsa",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, security.SECRET_KEY, algorithms=[security.ALGORITHM])
+        username: str = payload.get("sub")
+
+        # Pastikan ini adalah token 'reset'
+        if payload.get("token_type") != "reset":
+            raise credentials_exception
+        if username is None:
+            raise credentials_exception
+
+    except JWTError: # Termasuk 'ExpiredSignatureError'
+        raise credentials_exception
+
+    user = security.get_user(db, username=username)
+    if user is None:
+        raise credentials_exception
+    return user
+
+@app.post("/api/auth/refresh")
+def refresh_access_token(
+    current_user: models.User = Depends(get_current_user_from_refresh_token)
+):
+    """
+    Menerima refresh token yang valid dan mengembalikan access token baru.
+    """
+    # Jika kode sampai di sini, refresh token sudah valid.
+    # Buat HANYA access token baru (umur pendek).
+    access_token_expires = timedelta(minutes=security.ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = security.create_access_token(
+        data={"sub": current_user.username}, expires_delta=access_token_expires
+    )
+
+    return {
+        "accessToken": access_token,
+        "tokenType": "bearer"
+    }
 # ... (kode lainnya) ...
 
 @app.get("/users/me", response_model=schemas.UserWithTeams, response_model_by_alias=True)
@@ -604,6 +695,70 @@ def create_team(team: schemas.TeamCreate, db: Session = Depends(database.get_db)
     
     return db_team
 
+@app.post("/api/auth/forgot-password")
+def request_password_reset(
+    request: schemas.ForgotPasswordRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(database.get_db)
+):
+    user = security.get_user(db, username=request.username)
+
+    # PENTING: Jangan beri tahu jika user ada atau tidak.
+    # Tapi kita cek di internal apakah user ada dan punya No. HP.
+    if user and user.nohp:
+        # Buat token reset (JWT 15 menit)
+        reset_token_expires = timedelta(minutes=security.PASSWORD_RESET_EXPIRE_MINUTES)
+        reset_token = security.create_reset_token(
+            data={"sub": user.username}, expires_delta=reset_token_expires
+        )
+
+        # Buat link dan pesan WA
+        base_url = "https://sinergi.statsntb.id" # URL Frontend Anda
+        full_link = f"{base_url}/reset-password?token={reset_token}"
+
+        wa_message = (
+            f"🔑 *Permintaan Reset Password SINERGI*\n\n"
+            f"Halo {user.nama_lengkap},\n"
+            f"Kami menerima permintaan untuk mereset password akun Anda. "
+            f"Silakan klik link di bawah ini untuk melanjutkan:\n\n"
+            f"{full_link}\n\n"
+            f"Link ini hanya berlaku selama *15 menit*.\n"
+            f"Jika Anda tidak merasa meminta ini, mohon abaikan pesan ini."
+        )
+
+        # Kirim WA di background
+        background_tasks.add_task(
+            services_wa.send_whatsapp_message,
+            phone_number=user.nohp,
+            message=wa_message
+        )
+
+    # Selalu kembalikan pesan sukses (untuk keamanan)
+    return {"message": "Jika akun Anda terdaftar dengan No. HP, link reset akan dikirim."}
+
+@app.post("/api/auth/reset-password")
+def handle_password_reset(
+    request: schemas.ResetPasswordRequest,
+    db: Session = Depends(database.get_db)
+):
+    # Validasi token dan ambil user
+    # Kita panggil dependency secara manual di sini
+    try:
+        user = asyncio.run(get_user_from_reset_token(token=request.token, db=db))
+    except HTTPException:
+         raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Token reset tidak valid atau kedaluwarsa."
+        )
+
+    # Jika token valid, hash password baru dan simpan
+    hashed_password = security.get_password_hash(request.new_password)
+    user.hashed_password = hashed_password
+
+    db.commit()
+
+    return {"message": "Password Anda telah berhasil direset. Silakan login."}
+
 @app.get("/api/teams", response_model=schemas.TeamPage, response_model_by_alias=True)
 def get_all_teams(
     db: Session = Depends(database.get_db),
@@ -769,8 +924,8 @@ def add_team_member(team_id: int, user_id: int, background_tasks: BackgroundTask
         nama_tim = db_team.nama_tim
         link_detail = f"/team/detail/{db_team.id}"
         
-        title_notif = f"Anda ditambahkan ke Tim {nama_tim}"
-        message_notif = f"Anda sekarang adalah anggota Tim {nama_tim}. Klik untuk melihat detail tim."
+        title_notif = f"Anda ditambahkan ke {nama_tim}"
+        message_notif = f"Anda sekarang adalah anggota {nama_tim}. Klik untuk melihat detail tim."
         
         create_notification(
             db, 
@@ -809,7 +964,7 @@ def remove_team_member(team_id: int, user_id: int, background_tasks: BackgroundT
     # --- LOGIKA NOTIFIKASI BARU: Anggota Dihapus ---
     
     title_notif = f"Keanggotaan Tim Berakhir"
-    message_notif = f"Anda telah dikeluarkan dari Tim {nama_tim} oleh Administrator. Anda tidak lagi memiliki akses ke proyek dan aktivitas tim tersebut."
+    message_notif = f"Anda telah dikeluarkan dari {nama_tim} oleh Admin. Anda tidak lagi memiliki akses ke proyek dan aktivitas tim tersebut."
     
     create_notification(
         db, 
