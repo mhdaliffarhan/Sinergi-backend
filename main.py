@@ -9,10 +9,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from datetime import timedelta, date, datetime
 from openpyxl import Workbook
+from openpyxl.styles import Alignment
 from jose import JWSError, jwt
 from pydantic import BaseModel
 
-import models, database, schemas, security, uuid, io, os, shutil, uuid, io, zipfile, services_wa, asyncio
+import models, database, schemas, security, uuid, io, os, shutil, uuid, io, zipfile, services_wa, asyncio, tempfile, re
 
 # ===================================================================
 # INISIALISASI & KONFIGURASI
@@ -32,16 +33,48 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DOKUMEN_DIRECTORY = "./dokumen"
+# DOKUMEN_DIRECTORY = "./dokumen"
+STORAGE_DIRECTORY = "./storage"
 UPLOAD_PROFILE_PIC_DIR = "./profile-picture"
 
-if not os.path.exists(DOKUMEN_DIRECTORY):
-    os.makedirs(DOKUMEN_DIRECTORY)
-app.mount("/dokumen", StaticFiles(directory="dokumen"), name="dokumen")
+if not os.path.exists(STORAGE_DIRECTORY):
+    os.makedirs(STORAGE_DIRECTORY)
+
+app.mount("/storage", StaticFiles(directory="storage"), name="storage")
 
 if not os.path.exists(UPLOAD_PROFILE_PIC_DIR):
     os.makedirs(UPLOAD_PROFILE_PIC_DIR)
 app.mount("/profile-picture", StaticFiles(directory="profile-picture"), name="profile-picture")
+
+def save_file_securely(file: UploadFile) -> str:
+    """
+    Menyimpan file dengan nama UUID di folder berdasarkan Tahun/Bulan.
+    Returns: Relative path string (contoh: 'storage/2024/11/550e8400.pdf')
+    """
+    # 1. Ekstensi File
+    filename = file.filename
+    ext = filename.split('.')[-1] if '.' in filename else 'bin'
+    
+    # 2. Buat Struktur Folder: storage/YYYY/MM
+    now = datetime.now()
+    folder_path = os.path.join(STORAGE_DIRECTORY, str(now.year), f"{now.month:02d}")
+    
+    if not os.path.exists(folder_path):
+        os.makedirs(folder_path, exist_ok=True)
+    
+    # 3. Generate Nama File UUID
+    unique_filename = f"{uuid.uuid4()}.{ext}"
+    file_path = os.path.join(folder_path, unique_filename)
+    
+    # 4. Simpan Fisik
+    with open(file_path, "wb+") as file_object:
+        shutil.copyfileobj(file.file, file_object)
+        
+    # 5. Return Path Relatif (untuk disimpan di DB)
+    # Kita ubah backslash windows (\) jadi forward slash (/) agar standar web
+    relative_path = os.path.relpath(file_path, start=".").replace("\\", "/")
+    
+    return relative_path
 
 def get_document_path(db: Session, project_id: Optional[int] = None, aktivitas_id: Optional[int] = None):
     """
@@ -162,7 +195,47 @@ def create_notification(
     
     return db_notif
 
+# Helper membersihkan nama folder dari karakter terlarang
+def sanitize_filename(name: str) -> str:
+    """Membersihkan string agar aman digunakan sebagai nama file/folder."""
+    # Ganti karakter ilegal dengan underscore atau kosong
+    # Hapus karakter: < > : " / \ | ? *
+    cleaned = re.sub(r'[<>:"/\\|?*]', '', name)
+    # Hapus spasi berlebih
+    return " ".join(cleaned.split())
 
+def add_dokumen_to_zip(zip_file, dokumen_list, base_folder_path=""):
+    """
+    Fungsi reusable untuk memasukkan list dokumen ke dalam ZIP 
+    dengan struktur folder berdasarkan keterangan/checklist.
+    """
+    for doc in dokumen_list:
+        if doc.tipe == 'FILE' and doc.path_atau_url and os.path.exists(doc.path_atau_url):
+            # Tentukan nama sub-folder (Grouping)
+            # Jika punya parent checklist, gunakan nama checklist
+            # Jika tidak, gunakan keterangan dokumen
+            sub_folder_name = "Dokumen Lainnya"
+            if doc.checklist_item:
+                sub_folder_name = doc.checklist_item.nama_dokumen
+            elif doc.keterangan:
+                sub_folder_name = doc.keterangan
+            
+            clean_sub_folder = sanitize_filename(sub_folder_name)
+            clean_filename = sanitize_filename(doc.nama_file_asli)
+            
+            # Struktur: [Base Path] / [Nama Sub Folder] / [Nama File]
+            # Contoh: [251124]_Rapat/Notulensi/scan_notulensi.pdf
+            zip_path = f"{base_folder_path}/{clean_sub_folder}/{clean_filename}"
+            
+            # Hindari double slash jika base_folder kosong
+            if not base_folder_path:
+                zip_path = f"{clean_sub_folder}/{clean_filename}"
+
+            try:
+                zip_file.write(doc.path_atau_url, arcname=zip_path)
+            except Exception as e:
+                print(f"Gagal zip file {doc.id}: {e}")
+                
 # ===================================================================
 # ENDPOINT OTENTIKASI & PENGGUNA
 # ===================================================================
@@ -1139,7 +1212,7 @@ def create_project(project: schemas.ProjectCreate, background_tasks: BackgroundT
     
     # 2. Definisikan Notifikasi Umum (Untuk Semua Anggota Tim)
     title_umum = f"Project Baru ditambahkan: {nama_project}"
-    message_umum = f"Ketua Tim Anda telah membuat Project baru di bawah Tim {project_with_relations.team.nama_tim}."
+    message_umum = f"Ketua Tim Anda telah membuat Project baru di bawah {project_with_relations.team.nama_tim}."
     
     # 3. Definisikan Notifikasi Khusus (Untuk Project Leader)
     title_leader = f"Anda Project Leader Project {nama_project}!"
@@ -1167,7 +1240,8 @@ def create_project(project: schemas.ProjectCreate, background_tasks: BackgroundT
                 massage=message_umum, 
                 link_to=link_detail, 
                 background_tasks=background_tasks,
-                project_id=db_project.id
+                project_id=db_project.id,
+                send_whatsapp=False
             )
             
     db.commit() # Commit notifikasi
@@ -1230,7 +1304,8 @@ def get_project_by_id(project_id: int, db: Session = Depends(database.get_db)):
     # db_project.aktivitas = active_aktivitas
 
     all_aktivitas = db.query(models.Aktivitas).options(
-        joinedload(models.Aktivitas.daftar_dokumen_wajib)
+        joinedload(models.Aktivitas.daftar_dokumen_wajib),
+        joinedload(models.Aktivitas.dokumen)
     ).with_parent(db_project).order_by(
         desc(models.Aktivitas.tanggal_mulai)
     ).all()
@@ -1391,50 +1466,53 @@ def create_aktivitas(
     db: Session = Depends(database.get_db),
     current_user: models.User = Depends(security.get_current_user),
 ):
-    print("--- Memulai proses pembuatan aktivitas ---")
-    print(f"Data payload yang diterima: {aktivitas.dict()}")
-
-    # Ekstrak data yang akan digunakan untuk membuat instance model Aktivitas
-    aktivitas_data = {
-        "nama_aktivitas": aktivitas.nama_aktivitas,
-        "deskripsi": aktivitas.deskripsi,
-        "tanggal_mulai": aktivitas.tanggal_mulai,
-        "tanggal_selesai": aktivitas.tanggal_selesai,
-        "jam_mulai": aktivitas.jam_mulai,
-        "jam_selesai": aktivitas.jam_selesai,
-        "team_id": aktivitas.team_id,
-        "project_id": aktivitas.project_id,
-        "melibatkan_kepala": aktivitas.melibatkan_kepala
-    }
+    # 1. BERSIHKAN PAYLOAD
+    aktivitas_payload = aktivitas.dict()
     
-    # Set creator_user_id dari pengguna yang sedang login
-    aktivitas_data['creator_user_id'] = current_user.id
+    # Ambil dan hapus field list khusus (agar tidak error saat masuk ke models.Aktivitas)
+    anggota_ids = aktivitas_payload.pop('anggota_aktivitas_ids', [])
+    doc_wajib_names = aktivitas_payload.pop('daftar_dokumen_wajib', [])
     
-    # Buat instance model Aktivitas dengan data yang sudah difilter
-    db_aktivitas = models.Aktivitas(**aktivitas_data)
+    # V AMBIL ID TIM TERKAIT V
+    tim_terkait_ids = aktivitas_payload.pop('id_tim_terkait', []) 
+    # ^ ------------------ ^
 
-    # Tambahkan anggota tim ke objek aktivitas
-    anggota_aktivitas_ids = list(set(aktivitas.anggota_aktivitas_ids)) # Gunakan set untuk menghapus duplikat
+    # Hapus field helper form
+    aktivitas_payload.pop('use_date_range', None)
+    aktivitas_payload.pop('use_time', None)
+
+    # 2. BUAT INSTANCE AKTIVITAS
+    db_aktivitas = models.Aktivitas(**aktivitas_payload)
+    db_aktivitas.creator_user_id = current_user.id
     
-    print(f"Daftar final ID anggota yang akan ditambahkan: {anggota_aktivitas_ids}")
+    # 3. PROSES RELASI
+    
+    # A. Anggota Tim
+    if anggota_ids:
+        unique_anggota_ids = list(set(anggota_ids))
+        anggota_tim = db.query(models.User).filter(models.User.id.in_(unique_anggota_ids)).all()
+        db_aktivitas.users.extend(anggota_tim)
 
-    if anggota_aktivitas_ids:
-        anggota_tim = db.query(models.User).filter(models.User.id.in_(anggota_aktivitas_ids)).all()
-        for user in anggota_tim:
-            db_aktivitas.users.append(user)
-        print(f"Berhasil melampirkan {len(anggota_tim)} anggota ke aktivitas.")
-    else:
-        print("Tidak ada anggota yang ditambahkan ke aktivitas ini.")
-
-
-    # Tambahkan daftar dokumen wajib
-    for nama_dok in aktivitas.daftar_dokumen_wajib:
+    # B. Dokumen Wajib
+    for nama_dok in doc_wajib_names:
         if nama_dok:
             db_aktivitas.daftar_dokumen_wajib.append(
                 models.DaftarDokumen(nama_dokumen=nama_dok, status_pengecekan=False)
             )
 
-    # Simpan ke database
+    # C. Tim Terkait (LOGIKA UTAMA)
+    if tim_terkait_ids:
+        # Filter ID unik dan pastikan bukan tim penyelenggara sendiri
+        unique_tim_ids = list(set(tim_terkait_ids))
+        if db_aktivitas.team_id in unique_tim_ids:
+            unique_tim_ids.remove(db_aktivitas.team_id)
+            
+        if unique_tim_ids:
+            teams_to_add = db.query(models.Team).filter(models.Team.id.in_(unique_tim_ids)).all()
+            # Masukkan ke relasi 'tim_terkait'
+            db_aktivitas.tim_terkait.extend(teams_to_add)
+
+    # 4. SIMPAN
     db.add(db_aktivitas)
     db.commit()
     db.refresh(db_aktivitas)
@@ -1529,7 +1607,7 @@ def create_aktivitas(
 
 @app.get("/api/aktivitas/download-excel", response_class=StreamingResponse)
 def download_aktivitas_excel(
-    db: Session =Depends(database.get_db),
+    db: Session = Depends(database.get_db),
     current_user: models.User = Depends(security.get_current_user),
     user_scope: str = 'me',
     month: Optional[int] = None,
@@ -1540,7 +1618,7 @@ def download_aktivitas_excel(
         joinedload(models.Aktivitas.team)
     )
 
-    if user_scope == 'me': 
+    if user_scope == 'me':
         query = query.filter(models.Aktivitas.users.any(id=current_user.id))
 
     if month:
@@ -1548,45 +1626,194 @@ def download_aktivitas_excel(
     if year:
         query = query.filter(extract('year', models.Aktivitas.tanggal_mulai) == year)
 
-    # Ambil semua data yang cocok (tanpa pagination)
+    # Ambil semua data
     aktivitas_list = query.order_by(models.Aktivitas.tanggal_mulai.desc()).all()
 
-    # Buat File Excel di Memori
+    # Buat File Excel
     wb = Workbook()
     ws = wb.active
     ws.title = "Daftar Aktivitas"
     
-    # Buat Header
-    headers = ["Nama Aktivitas", "Nama Proyek", "Tim", "Bukti Dukung (Link)"]
+    # --- HEADER (DIREVISI SESUAI PERMINTAAN) ---
+    # Urutan: No, Waktu (4 kolom), Nama, Proyek, Tim, Link
+    headers = [
+        "No",
+        "Tanggal Mulai", 
+        "Tanggal Selesai", 
+        "Jam Mulai", 
+        "Jam Selesai", 
+        "Nama Aktivitas", 
+        "Nama Proyek", 
+        "Tim", 
+        "Bukti Dukung (Link)"
+    ]
     ws.append(headers)
 
-    # 3. Isi Data
-    base_url = "https://sinergi.statsntb.id" # URL frontend Anda
-    for aktivitas in aktivitas_list:
-        # Menggunakan nama relasi dari model Anda
+    # Style Header
+    for cell in ws[1]:
+        cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+
+    # --- ISI DATA ---
+    base_url = "https://sinergi.statsntb.id" 
+    
+    # Gunakan enumerate untuk mendapatkan nomor urut (index) mulai dari 1
+    for index, aktivitas in enumerate(aktivitas_list, start=1):
+        
+        # Persiapkan Data
         project_name = aktivitas.project.nama_project if aktivitas.project else "N/A"
         team_name = aktivitas.team.nama_tim if aktivitas.team else "N/A"
         link = f"{base_url}/public/aktivitas/{aktivitas.public_id}"
         
-        ws.append([
-            aktivitas.nama_aktivitas,
-            project_name,
-            team_name,
-            link
-        ])
+        # Format Waktu
+        tgl_mulai_str = aktivitas.tanggal_mulai.strftime('%Y-%m-%d') if aktivitas.tanggal_mulai else ""
+        tgl_selesai_str = aktivitas.tanggal_selesai.strftime('%Y-%m-%d') if aktivitas.tanggal_selesai else ""
+        jam_mulai_str = aktivitas.jam_mulai.strftime('%H:%M') if aktivitas.jam_mulai else ""
+        jam_selesai_str = aktivitas.jam_selesai.strftime('%H:%M') if aktivitas.jam_selesai else ""
 
-    # Simpan ke stream (buffer)
+        # --- APPEND ROW (URUTAN BARU) ---
+        row_data = [
+            index,           # Kolom A: No
+            tgl_mulai_str,   # Kolom B: Tgl Mulai
+            tgl_selesai_str, # Kolom C: Tgl Selesai
+            jam_mulai_str,   # Kolom D: Jam Mulai
+            jam_selesai_str, # Kolom E: Jam Selesai
+            aktivitas.nama_aktivitas, # Kolom F: Nama
+            project_name,    # Kolom G: Proyek
+            team_name,       # Kolom H: Tim
+            link             # Kolom I: Link
+        ]
+        ws.append(row_data)
+        
+        # (Opsional) Set alignment center untuk No dan Waktu
+        current_row = ws.max_row
+        # Kolom 1 s.d 5 (A-E) rata tengah
+        for col_idx in range(1, 6): 
+            cell = ws.cell(row=current_row, column=col_idx)
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+
+    # --- AUTO WIDTH (DISESUAIKAN DENGAN URUTAN BARU) ---
+    column_widths = {
+        'A': 5,  # No (Kecil)
+        'B': 15, # Tgl Mulai
+        'C': 15, # Tgl Selesai
+        'D': 10, # Jam Mulai
+        'E': 10, # Jam Selesai
+        'F': 40, # Nama Aktivitas (Lebar)
+        'G': 30, # Proyek
+        'H': 25, # Tim
+        'I': 50  # Link (Paling Lebar)
+    }
+    for col_letter, width in column_widths.items():
+        ws.column_dimensions[col_letter].width = width
+
+    # Simpan ke stream
     stream = io.BytesIO()
     wb.save(stream)
-    stream.seek(0) # Pindahkan kursor ke awal file
+    stream.seek(0)
 
-    # 5. Kembalikan sebagai file download
     filename = f"aktivitas_{user_scope}_{year}_{month}.xlsx" if month and year else f"aktivitas_{user_scope}.xlsx"
+    
     return StreamingResponse(
         stream, 
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
+
+# --- ENDPOINT BACKUP FILE BULANAN ---
+@app.get("/api/aktivitas/backup-monthly")
+def backup_monthly_files(
+    month: int,
+    year: int,
+    background_tasks: BackgroundTasks, # Penting untuk menghapus file temp setelah kirim
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(security.get_current_user)
+):
+    """
+    Membuat file ZIP berisi semua dokumen aktivitas pada bulan/tahun tertentu.
+    Struktur ZIP: [Tgl] Nama Aktivitas / Nama File Asli.ext
+    """
+    
+    # 1. Query Aktivitas (Filter sama seperti Excel)
+    # Kita filter berdasarkan scope user juga (opsional, disini saya buat agar user hanya backup apa yang dia boleh lihat)
+    # Atau jika ini fitur khusus admin/kepala, sesuaikan filternya.
+    # Disini saya asumsi backup sesuai hak akses user (seperti excel 'me' atau 'all')
+    # Untuk default backup bulanan, kita ambil semua aktivitas yang user ini terlibat.
+    
+    query = db.query(models.Aktivitas).options(
+        joinedload(models.Aktivitas.dokumen)
+    ).filter(
+        extract('month', models.Aktivitas.tanggal_mulai) == month,
+        extract('year', models.Aktivitas.tanggal_mulai) == year,
+        # Filter hak akses: User harus terlibat di aktivitas tersebut
+        models.Aktivitas.users.any(id=current_user.id) 
+    )
+    
+    aktivitas_list = query.all()
+
+    if not aktivitas_list:
+        raise HTTPException(status_code=404, detail="Tidak ada aktivitas ditemukan untuk bulan ini.")
+
+    # 2. Siapkan File ZIP Sementara
+    # Kita tidak membuatnya di RAM agar server tidak crash jika filenya besar (GBs)
+    try:
+        # Buat file temp, delete=False agar kita bisa membacanya nanti untuk dikirim
+        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+        tmp_path = tmp_file.name
+        
+        files_added_count = 0
+        
+        with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for aktivitas in aktivitas_list:
+                # Buat Nama Folder: "[01] Rapat Koordinasi"
+                tgl = aktivitas.tanggal_mulai.strftime('%d') if aktivitas.tanggal_mulai else "00"
+                safe_activity_name = sanitize_filename(aktivitas.nama_aktivitas)
+                # Potong nama jika terlalu panjang agar tidak error path limit
+                if len(safe_activity_name) > 50:
+                    safe_activity_name = safe_activity_name[:50] + "..."
+                    
+                folder_name = f"[{tgl}] {safe_activity_name}"
+                
+                # Loop Dokumen
+                for doc in aktivitas.dokumen:
+                    # Kita hanya backup FILE, bukan LINK
+                    if doc.tipe == 'FILE' and doc.path_atau_url:
+                        # Cek apakah file fisik ada
+                        if os.path.exists(doc.path_atau_url):
+                            # Nama file di dalam ZIP
+                            safe_filename = sanitize_filename(doc.nama_file_asli)
+                            zip_entry_path = f"{folder_name}/{safe_filename}"
+                            
+                            try:
+                                # Tulis file ke ZIP
+                                zipf.write(doc.path_atau_url, arcname=zip_entry_path)
+                                files_added_count += 1
+                            except Exception as e:
+                                print(f"Gagal zip file {doc.id}: {e}")
+        
+        tmp_file.close() # Tutup handle file agar bisa dibuka oleh FileResponse
+
+        if files_added_count == 0:
+            os.remove(tmp_path) # Hapus temp kosong
+            raise HTTPException(status_code=404, detail="Aktivitas ditemukan, tapi tidak ada dokumen fisik yang tersimpan.")
+
+        # 3. Kirim File dan Jadwalkan Penghapusan
+        filename = f"Backup_Aktivitas_{year}_{month}.zip"
+        
+        # Background task untuk menghapus file temp setelah download selesai
+        background_tasks.add_task(os.remove, tmp_path)
+
+        return FileResponse(
+            path=tmp_path,
+            filename=filename,
+            media_type='application/zip'
+        )
+
+    except Exception as e:
+        # Bersihkan jika error di tengah jalan
+        if 'tmp_path' in locals() and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        print(f"Error backup: {e}")
+        raise HTTPException(status_code=500, detail="Terjadi kesalahan saat memproses backup.")
 
 # --- ENDPOINT MENGAMBIL DETAIL AKTIVITAS ---
 @app.get("/api/aktivitas/{aktivitas_id}", response_model=schemas.Aktivitas)
@@ -1594,7 +1821,10 @@ def get_aktivitas_by_id(aktivitas_id: int, db: Session = Depends(database.get_db
     # Query database untuk mencari aktivitas dengan ID yang sesuai
     db_aktivitas = db.query(models.Aktivitas).options(
         joinedload(models.Aktivitas.dokumen),   
-        joinedload(models.Aktivitas.daftar_dokumen_wajib)
+        joinedload(models.Aktivitas.daftar_dokumen_wajib),
+        joinedload(models.Aktivitas.team),
+        joinedload(models.Aktivitas.tim_terkait),
+        joinedload(models.Aktivitas.users)
     ).filter(models.Aktivitas.id == aktivitas_id).first()
     
     # Jika aktivitas tidak ditemukan, kirim error 404
@@ -1612,71 +1842,78 @@ def update_aktivitas(
     db: Session = Depends(database.get_db), 
     current_user: models.User = Depends(security.get_current_user)
 ):
-    """Memperbarui aktivitas yang ada beserta anggota tim dan dokumen wajibnya."""
+    """Memperbarui aktivitas beserta relasinya (Anggota, Dokumen Wajib, Tim Terkait)."""
+    
+    # Load aktivitas dengan semua relasi agar bisa di-update
     db_aktivitas = db.query(models.Aktivitas).options(
         joinedload(models.Aktivitas.daftar_dokumen_wajib),
-        joinedload(models.Aktivitas.users)
+        joinedload(models.Aktivitas.users),
+        joinedload(models.Aktivitas.tim_terkait) # Load relasi ini
     ).filter(models.Aktivitas.id == aktivitas_id).first()
+    
     if db_aktivitas is None:
         raise HTTPException(status_code=404, detail="Aktivitas tidak ditemukan")
 
-    # Logika untuk mengambil ID user Kepala Kantor
-    kepala_kantor_id = None
-    JABATAN_KEPALA_KANTOR_ID = 1 # Ganti dengan ID jabatan Kepala Kantor yang sesuai
-    kepala_kantor = db.query(models.User).filter(
-        models.User.jabatan_id == JABATAN_KEPALA_KANTOR_ID
-    ).first()
-    if kepala_kantor:
-        kepala_kantor_id = kepala_kantor.id
-
-    # 1. Update data utama aktivitas
+    # 1. Ambil Data Payload
     update_data = aktivitas.dict(exclude_unset=True)
-    anggota_aktivitas_ids = update_data.pop('anggota_aktivitas_ids', [])
-    daftar_dokumen_wajib = update_data.pop('daftar_dokumen_wajib', [])
-    melibatkan_kepala_kantor = update_data.pop('melibatkan_kepala_kantor', False)
+    
+    # Pisahkan data relasi
+    anggota_ids = update_data.pop('anggota_aktivitas_ids', None)
+    doc_wajib_names = update_data.pop('daftar_dokumen_wajib', None)
+    tim_terkait_ids = update_data.pop('id_tim_terkait', None) # <-- AMBIL ID BARU
+
+    # Bersihkan field helper
     update_data.pop('use_date_range', None)
     update_data.pop('use_time', None)
     
-    # Update field-field utama
+    # 2. Update Field Dasar (Nama, Deskripsi, Tanggal, dll)
     for key, value in update_data.items():
         setattr(db_aktivitas, key, value)
     
-    # 2. Update anggota tim yang terlibat (Hubungan Many-to-Many)
-    final_anggota_ids = set(anggota_aktivitas_ids)
-    if melibatkan_kepala_kantor and kepala_kantor_id:
-        final_anggota_ids.add(kepala_kantor_id)
-
-    existing_members = {user.id for user in db_aktivitas.users}
-    
-    members_to_add = final_anggota_ids - existing_members
-    members_to_remove = existing_members - final_anggota_ids
-
-    # Hapus anggota yang tidak dipilih lagi
-    if members_to_remove:
-        members_to_remove_obj = db.query(models.User).filter(models.User.id.in_(members_to_remove)).all()
-        for user in members_to_remove_obj:
-            if user in db_aktivitas.users:
-                db_aktivitas.users.remove(user)
-
-    # Tambahkan anggota baru
-    if members_to_add:
-        members_to_add_obj = db.query(models.User).filter(models.User.id.in_(members_to_add)).all()
-        for user in members_to_add_obj:
-            db_aktivitas.users.append(user)
-    
-    # 3. Update daftar dokumen wajib
-    existing_doc_names = {doc.nama_dokumen for doc in db_aktivitas.daftar_dokumen_wajib}
-    incoming_doc_names = set(daftar_dokumen_wajib)
-    
-    docs_to_delete = [doc for doc in db_aktivitas.daftar_dokumen_wajib if doc.nama_dokumen not in incoming_doc_names]
-    for doc in docs_to_delete:
-        db.delete(doc)
-
-    docs_to_add = incoming_doc_names - existing_doc_names
-    for doc_name in docs_to_add:
-        new_doc = models.DaftarDokumen(nama_dokumen=doc_name, aktivitas_id=aktivitas_id)
-        db.add(new_doc)
+    # 3. Update Anggota (Many-to-Many)
+    if anggota_ids is not None:
+        # Reset list users
+        db_aktivitas.users = [] 
+        if anggota_ids:
+            unique_ids = list(set(anggota_ids))
+            # Tambahkan kepala kantor jika opsi dipilih (opsional, logic ada di frontend biasanya)
+            # if aktivitas.melibatkan_kepala: ...
             
+            users_to_add = db.query(models.User).filter(models.User.id.in_(unique_ids)).all()
+            db_aktivitas.users.extend(users_to_add)
+    
+    # 4. Update Dokumen Wajib (One-to-Many)
+    # Logika: Hapus yang tidak ada di list baru, tambah yang baru
+    if doc_wajib_names is not None:
+        current_docs = {d.nama_dokumen: d for d in db_aktivitas.daftar_dokumen_wajib}
+        new_docs_set = set(doc_wajib_names)
+        
+        # Hapus
+        for name, doc_obj in list(current_docs.items()):
+            if name not in new_docs_set:
+                db.delete(doc_obj)
+        
+        # Tambah
+        for name in new_docs_set:
+            if name not in current_docs:
+                db_aktivitas.daftar_dokumen_wajib.append(
+                    models.DaftarDokumen(nama_dokumen=name, status_pengecekan=False)
+                )
+
+    # 5. Update Tim Terkait (Many-to-Many) - LOGIKA BARU
+    if tim_terkait_ids is not None:
+        # Bersihkan relasi lama
+        db_aktivitas.tim_terkait = []
+        
+        unique_tim_ids = list(set(tim_terkait_ids))
+        # Hindari memasukkan tim penyelenggara sendiri
+        if db_aktivitas.team_id in unique_tim_ids:
+            unique_tim_ids.remove(db_aktivitas.team_id)
+            
+        if unique_tim_ids:
+            teams_to_add = db.query(models.Team).filter(models.Team.id.in_(unique_tim_ids)).all()
+            db_aktivitas.tim_terkait.extend(teams_to_add)
+
     db.commit()
     db.refresh(db_aktivitas)
     return db_aktivitas
@@ -1743,59 +1980,45 @@ def delete_aktivitas(
 def create_dokumen_untuk_aktivitas(
     aktivitas_id: int,
     keterangan: str = Form(...),
-    checklist_item_id: Optional[int] = Form(None),
+    checklist_item_id: Optional[int] = Form(None), # ID dari DaftarDokumen
     file: UploadFile = File(...),
     db: Session = Depends(database.get_db)
 ):
-    # Inisialisasi variabel di luar blok try untuk mencegah UnboundLocalError
-    file_location = None
+    # 1. Validasi Aktivitas
+    aktivitas = db.query(models.Aktivitas).filter(models.Aktivitas.id == aktivitas_id).first()
+    if not aktivitas:
+        raise HTTPException(status_code=404, detail="Aktivitas tidak ditemukan")
 
     try:
-        # Cek aktivitas
-        aktivitas = db.query(models.Aktivitas).filter(models.Aktivitas.id == aktivitas_id).first()
-        if not aktivitas:
-            raise HTTPException(status_code=404, detail="Aktivitas tidak ditemukan")
-
-        # Panggil fungsi pembantu untuk mendapatkan direktori
-        target_dir = get_document_path(db, aktivitas_id=aktivitas_id)
+        # 2. Simpan File dengan metode Aman (Immutable)
+        # Tidak peduli nama aktivitas berubah, path ini tetap valid.
+        saved_path = save_file_securely(file)
         
-        file_extension = file.filename.split(".")[-1]
-        unique_filename = f"{uuid.uuid4()}.{file_extension}"
-        file_location = os.path.join(target_dir, unique_filename)
-
-        with open(file_location, "wb+") as file_object:
-            shutil.copyfileobj(file.file, file_object)
-        
+        # 3. Buat Entri Database
         db_dokumen = models.Dokumen(
             aktivitas_id=aktivitas_id,
             keterangan=keterangan,
             tipe='FILE',
-            path_atau_url=file_location,
-            nama_file_asli=file.filename,
-            tipe_file_mime=file.content_type
+            path_atau_url=saved_path,       # Path baru (storage/2025/...)
+            nama_file_asli=file.filename,   # Nama asli user (Laporan.pdf)
+            tipe_file_mime=file.content_type,
+            daftar_dokumen_id=checklist_item_id # Relasi ke Item Checklist (One-to-Many)
         )
+        
         db.add(db_dokumen)
         db.commit()
         db.refresh(db_dokumen)
 
-        if checklist_item_id:
-            db_checklist_item = db.query(models.DaftarDokumen).filter(models.DaftarDokumen.id == checklist_item_id).first()
-            if db_checklist_item:
-                db_checklist_item.status_pengecekan = False
-                db_checklist_item.dokumen_id = db_dokumen.id
-                db.commit()
-        
+        # 4. Update Status Pengecekan (Opsional)
+        # Jika di-upload ke checklist, kita bisa otomatis tandai sesuatu, 
+        # atau biarkan manual (validasi ketua tim).
+        # Disini kita biarkan status_pengecekan apa adanya (default False).
+
         return db_dokumen
 
-    except HTTPException as e:
-        # Menangkap error HTTP dan meneruskannya
-        raise e
     except Exception as e:
-        # Menangkap error umum, mencetak ke konsol server, dan menghapus file jika sudah dibuat
-        print(f"Error saat mengunggah dokumen di aktivitas {aktivitas_id}: {e}")
-        if file_location and os.path.exists(file_location):
-            os.remove(file_location)
-        raise HTTPException(status_code=500, detail=f"Terjadi kesalahan di server: {str(e)}")
+        print(f"Error upload: {e}")
+        raise HTTPException(status_code=500, detail="Gagal mengunggah file")
 
 # --- ENDPOINT MENAMBAHKAN LINK ---
 @app.post("/api/aktivitas/{aktivitas_id}/link", response_model=schemas.Dokumen)
@@ -1814,7 +2037,9 @@ def add_link_untuk_aktivitas(
         aktivitas_id=aktivitas_id,
         keterangan=link_data.keterangan,
         tipe='LINK',
-        path_atau_url=link_data.path_atau_url
+        path_atau_url=link_data.path_atau_url,
+        nama_file_asli=link_data.nama_file_asli,
+        daftar_dokumen_id=link_data.checklist_item_id
     )
 
     db.add(db_dokumen)
@@ -1831,42 +2056,31 @@ def create_dokumen_untuk_proyek(
     file: UploadFile = File(...),
     db: Session = Depends(database.get_db)
 ):
-    """
-    Mengunggah file ke sebuah proyek.
-    File akan disimpan di jalur: /dokumen/{tahun}/{nama_tim}/{nama_proyek}/
-    """
-    # 1. Cari proyek berdasarkan ID
     project = db.query(models.Project).filter(models.Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Proyek tidak ditemukan")
 
-    # 2. Dapatkan jalur penyimpanan baru menggunakan fungsi pembantu
-    target_dir = get_document_path(db, project_id=project_id)
-    file_extension = file.filename.split(".")[-1]
-    unique_filename = f"{uuid.uuid4()}.{file_extension}"
-    file_location = os.path.join(target_dir, unique_filename)
-
-    # 3. Simpan file fisik
     try:
-        with open(file_location, "wb+") as file_object:
-            shutil.copyfileobj(file.file, file_object)
-    finally:
-        file.file.close()
-
-    # 4. Buat entri dokumen baru di database dengan project_id
-    db_dokumen = models.Dokumen(
-        project_id=project_id,
-        keterangan=keterangan,
-        tipe='FILE',
-        path_atau_url=file_location,
-        nama_file_asli=file.filename,
-        tipe_file_mime=file.content_type
-    )
-    db.add(db_dokumen)
-    db.commit()
-    db.refresh(db_dokumen)
-    
-    return db_dokumen
+        # 1. Gunakan helper save_file_securely (Storage Immutable)
+        saved_path = save_file_securely(file)
+        
+        # 2. Simpan ke Database
+        db_dokumen = models.Dokumen(
+            project_id=project_id,
+            keterangan=keterangan,
+            tipe='FILE',
+            path_atau_url=saved_path,
+            nama_file_asli=file.filename,
+            tipe_file_mime=file.content_type
+        )
+        db.add(db_dokumen)
+        db.commit()
+        db.refresh(db_dokumen)
+        
+        return db_dokumen
+    except Exception as e:
+        print(f"Error upload project doc: {e}")
+        raise HTTPException(status_code=500, detail="Gagal mengunggah file")
 
 # --------------------------------------------------------------------
 
@@ -1958,28 +2172,50 @@ def replace_checklist_dokumen(
 # --- ENDPOIN MENGHAPUS DOKUMEN ---
 @app.delete("/api/dokumen/{dokumen_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_dokumen(dokumen_id: int, db: Session = Depends(database.get_db)):
+    # 1. Cari Dokumen yang akan dihapus
     db_dokumen = db.query(models.Dokumen).filter(models.Dokumen.id == dokumen_id).first()
     
     if db_dokumen is None:
         raise HTTPException(status_code=404, detail="Dokumen tidak ditemukan")
 
-    # --- LOGIKA BARU: PERBARUI CHECKLIST ---
-    db_checklist_item = db.query(models.DaftarDokumen).filter(models.DaftarDokumen.dokumen_id == dokumen_id).first()
-    
-    # 3. Jika ada, reset status dan tautannya
-    if db_checklist_item:
-        db_checklist_item.status_pengecekan = False 
-        db_checklist_item.dokumen_id = None
+    # 2. [LOGIKA BARU] Reset Checklist Item (jika dokumen ini terhubung)
+    # Kita cek apakah dokumen ini punya parent 'daftar_dokumen_id'
+    if db_dokumen.daftar_dokumen_id:
+        # Cari item checklist induknya
+        db_checklist_item = db.query(models.DaftarDokumen).filter(
+            models.DaftarDokumen.id == db_dokumen.daftar_dokumen_id
+        ).first()
         
+        if db_checklist_item:
+            # Logika reset: Jika dokumen ini dihapus, apakah checklist harus jadi unchecked?
+            # Karena sekarang 'One-to-Many', satu checklist bisa punya banyak file.
+            # Kita hanya uncheck jika ini adalah SATU-SATUNYA file di checklist tersebut.
+            
+            # Hitung sisa file lain di checklist ini
+            count_other_files = db.query(models.Dokumen).filter(
+                models.Dokumen.daftar_dokumen_id == db_checklist_item.id,
+                models.Dokumen.id != dokumen_id # Kecuali yang mau dihapus
+            ).count()
+            
+            if count_other_files == 0:
+                # Jika tidak ada file lain, tandai belum selesai
+                db_checklist_item.status_pengecekan = False 
+
+    # 3. Hapus File Fisik (Jika tipe FILE)
     if db_dokumen.tipe == 'FILE':
         file_path = db_dokumen.path_atau_url
-        if os.path.exists(file_path):
-            os.remove(file_path)
-            
+        # Pastikan path aman (tidak kosong) sebelum unlink
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except OSError as e:
+                print(f"Error deleting file {file_path}: {e}")
+                # Lanjutkan penghapusan DB meski file gagal dihapus (orphan file)
+    
+    # 4. Hapus dari Database
     db.delete(db_dokumen)
     db.commit()
     
-    # 4. Kembalikan respons tanpa konten
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 # ENDPOINT UNTUK MANAJEMEN CHECKLIST DOKUMEN
@@ -1997,7 +2233,8 @@ def update_status_pengecekan(
     """
     # Cari item checklist di database, lakukan join untuk mengambil data tim terkait
     db_item = db.query(models.DaftarDokumen).options(
-        joinedload(models.DaftarDokumen.aktivitas).joinedload(models.Aktivitas.team)
+        joinedload(models.DaftarDokumen.aktivitas).joinedload(models.Aktivitas.team),
+        joinedload(models.DaftarDokumen.files)
     ).filter(models.DaftarDokumen.id == item_id).first()
 
     if not db_item:
@@ -2009,7 +2246,7 @@ def update_status_pengecekan(
     # Ambil status lama sebelum diubah
     old_status = db_item.status_pengecekan
     new_status = status_update.status_pengecekan
-
+    
     # Validasi Keamanan: Pastikan pengguna adalah ketua tim
     # Pastikan ada aktivitas dan tim yang tertaut sebelum memeriksa
     if not db_item.aktivitas or not db_item.aktivitas.team:
@@ -2023,7 +2260,7 @@ def update_status_pengecekan(
     db.commit()
 
     # --- LOGIKA NOTIFIKASI ---
-    if old_status != new_status and db_item.dokumen_id:
+    if old_status != new_status and db_item.files:
         
         # A. Tentukan Konten Notifikasi
         nama_dokumen = db_item.nama_dokumen
@@ -2090,37 +2327,30 @@ def download_dokumen(
 
 # --- ENDPOINTUNTUK UNDUH SEMUA DOKUMEN DALAM SATU AKTIVITAS ---
 @app.get("/api/aktivitas/{aktivitas_id}/download-all")
-def download_all_dokumen(
+def download_all_dokumen_aktivitas(
     aktivitas_id: int,
-    db: Session = Depends(database.get_db),
-    current_user: models.User = Depends(security.get_current_user)
+    db: Session = Depends(database.get_db)
 ):
-    """
-    Mengunduh semua dokumen bertipe FILE dari sebuah aktivitas dalam bentuk .zip.
-    """
-    db_aktivitas = db.query(models.Aktivitas).options(
-        joinedload(models.Aktivitas.dokumen)
+    # Load aktivitas beserta dokumen dan checklistnya
+    aktivitas = db.query(models.Aktivitas).options(
+        joinedload(models.Aktivitas.dokumen).joinedload(models.Dokumen.checklist_item)
     ).filter(models.Aktivitas.id == aktivitas_id).first()
 
-    if not db_aktivitas:
+    if not aktivitas:
         raise HTTPException(status_code=404, detail="Aktivitas tidak ditemukan")
 
-    files_to_zip = [doc for doc in db_aktivitas.dokumen if doc.tipe == 'FILE' and os.path.exists(doc.path_atau_url)]
+    # Format Folder Utama: [YYMMDD]_[nama_aktivitas]
+    tgl = aktivitas.tanggal_mulai.strftime('%y%m%d') if aktivitas.tanggal_mulai else "000000"
+    folder_root = f"[{tgl}]_{sanitize_filename(aktivitas.nama_aktivitas)}"
 
-    # --- VALIDASI DOKUMEN KOSONG ---
-    if not files_to_zip:
-        raise HTTPException(status_code=404, detail="Tidak ada file yang bisa diunduh untuk aktivitas ini.")
-
-    # --- PROSES ZIPPING YANG LEBIH EFISIEN ---
     zip_buffer = io.BytesIO()
     
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-        for doc in files_to_zip:
-            zip_file.write(doc.path_atau_url, doc.nama_file_asli)
+        # Gunakan helper kita
+        add_dokumen_to_zip(zip_file, aktivitas.dokumen, base_folder_path=folder_root)
     
     zip_buffer.seek(0)
-
-    zip_filename = f"{db_aktivitas.nama_aktivitas.replace(' ', '_')}.zip"
+    zip_filename = f"{folder_root}.zip"
     
     return StreamingResponse(
         iter([zip_buffer.getvalue()]),
@@ -2128,6 +2358,109 @@ def download_all_dokumen(
         headers={'Content-Disposition': f'attachment; filename="{zip_filename}"'}
     )
 
+@app.get("/api/projects/{project_id}/download-all")
+def download_all_project_documents(
+    project_id: int,
+    db: Session = Depends(database.get_db)
+):
+    # Load Project + Dokumen Project + Aktivitas + Dokumen Aktivitas
+    project = db.query(models.Project).options(
+        joinedload(models.Project.dokumen), # Dokumen level project
+        joinedload(models.Project.aktivitas).joinedload(models.Aktivitas.dokumen).joinedload(models.Dokumen.checklist_item)
+    ).filter(models.Project.id == project_id).first()
+     
+    if not project:
+        raise HTTPException(status_code=404, detail="Proyek tidak ditemukan")
+
+    zip_buffer = io.BytesIO()
+    folder_project = sanitize_filename(project.nama_project)
+
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        
+        # 1. Masukkan Dokumen Level Project
+        # Disimpan di: [Nama Project]/[Keterangan Dokumen]
+        add_dokumen_to_zip(zip_file, project.dokumen, base_folder_path=folder_project)
+
+        # 2. Masukkan Dokumen Level Aktivitas
+        # Disimpan di: [Nama Project]/[YYMMDD]_[Nama Aktivitas]/[Keterangan]
+        for akt in project.aktivitas:
+            tgl = akt.tanggal_mulai.strftime('%y%m%d') if akt.tanggal_mulai else "000000"
+            folder_aktivitas = f"[{tgl}]_{sanitize_filename(akt.nama_aktivitas)}"
+            full_path = f"{folder_project}/{folder_aktivitas}"
+            
+            add_dokumen_to_zip(zip_file, akt.dokumen, base_folder_path=full_path)
+
+    zip_buffer.seek(0)
+    zip_filename = f"{folder_project}.zip"
+
+    return StreamingResponse(
+        iter([zip_buffer.getvalue()]),
+        media_type="application/x-zip-compressed",
+        headers={'Content-Disposition': f'attachment; filename="{zip_filename}"'}
+    )
+
+@app.get("/api/aktivitas/backup-monthly")
+def backup_monthly_files(
+    month: int,
+    year: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(security.get_current_user)
+):
+    # Query Aktivitas di bulan tersebut
+    query = db.query(models.Aktivitas).options(
+        joinedload(models.Aktivitas.team),
+        joinedload(models.Aktivitas.dokumen).joinedload(models.Dokumen.checklist_item)
+    ).filter(
+        extract('month', models.Aktivitas.tanggal_mulai) == month,
+        extract('year', models.Aktivitas.tanggal_mulai) == year,
+        models.Aktivitas.users.any(id=current_user.id) 
+    )
+    aktivitas_list = query.all()
+
+    if not aktivitas_list:
+        raise HTTPException(status_code=404, detail="Tidak ada aktivitas untuk di-backup.")
+
+    try:
+        # Gunakan file temp di disk untuk backup besar
+        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+        tmp_path = tmp_file.name
+        
+        with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for akt in aktivitas_list:
+                # Level 1: [YYMM] (Bulan) -> Opsional jika zipnya sudah bernama bulan
+                # Level 2: [nama_tim]
+                # Level 3: [YYMMDD]_[nama_aktivitas]
+                
+                folder_yy_mm = f"{str(year)[2:]}{month:02d}" # YYMM
+                folder_tim = sanitize_filename(akt.team.nama_tim) if akt.team else "Tanpa Tim"
+                
+                tgl_akt = akt.tanggal_mulai.strftime('%y%m%d') if akt.tanggal_mulai else "000000"
+                folder_akt = f"[{tgl_akt}]_{sanitize_filename(akt.nama_aktivitas)}"
+                
+                # Path Lengkap: 2411/Tim IPDS/[241127]_Rapat/....
+                full_base_path = f"{folder_yy_mm}/{folder_tim}/{folder_akt}"
+                
+                # Gunakan helper
+                add_dokumen_to_zip(zipf, akt.dokumen, base_folder_path=full_base_path)
+        
+        tmp_file.close()
+
+        filename = f"Backup_Sinergi_{year}_{month:02d}.zip"
+        background_tasks.add_task(os.remove, tmp_path)
+
+        return FileResponse(
+            path=tmp_path,
+            filename=filename,
+            media_type='application/zip'
+        )
+
+    except Exception as e:
+        if 'tmp_path' in locals() and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        print(f"Error backup: {e}")
+        raise HTTPException(status_code=500, detail="Gagal membuat backup.")
+    
 # ===================================================================
 # ENDPOINT BARU UNTUK KALENDER TIM
 # ===================================================================

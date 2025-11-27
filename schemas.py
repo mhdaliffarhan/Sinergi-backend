@@ -1,8 +1,6 @@
 from __future__ import annotations
 from uuid import UUID
-
 import re
-
 from pydantic import BaseModel, model_validator, field_validator, Field, ConfigDict
 from typing import Optional, Any, List
 from datetime import date, time, datetime
@@ -25,11 +23,10 @@ def validate_phone_number(nohp: Optional[str]) -> Optional[str]:
     if nohp_numeric.startswith('08'):
         nohp_numeric = '62' + nohp_numeric[1:]
 
-    # 3. Cek Aturan: Harus '62' dan 12-14 digit total
-    # (62 + 10-12 digit sisa = 12-14 total)
+    # 3. Cek Aturan: Harus '62' dan 11-14 digit total (Sesuai revisi terakhir)
     if not re.match(r"^62\d{9,12}$", nohp_numeric):
          raise ValueError(
-            "Nomor HP harus diawali 62 dan memiliki 12-14 digit (misal: 62812...)"
+            "Nomor HP harus diawali 62 dan memiliki 11-14 digit (misal: 62812...)"
          )
 
     return nohp_numeric
@@ -44,12 +41,11 @@ class CamelModel(BaseModel):
 
 
 # ===================================================================
-# SKEMA UNTUK PERAN & JABATAN
+# 1. SKEMA DASAR (Leaf Nodes)
 # ===================================================================
 class Jabatan(CamelModel):
     id: int
     nama_jabatan: str
-
 
 class SistemRole(CamelModel):
     id: int
@@ -57,7 +53,7 @@ class SistemRole(CamelModel):
 
 
 # ===================================================================
-# SKEMA UNTUK DOKUMEN
+# 2. SKEMA DOKUMEN (Harus di awal karena dipakai banyak entitas)
 # ===================================================================
 class DokumenBase(CamelModel):
     keterangan: str
@@ -65,32 +61,34 @@ class DokumenBase(CamelModel):
     path_atau_url: Optional[str] = None
     nama_file_asli: Optional[str] = None
     tipe_file_mime: Optional[str] = None
-
+    checklist_item_id: Optional[int] = None # Untuk payload upload
 
 class DokumenCreate(DokumenBase):
     pass
-
 
 class Dokumen(DokumenBase):
     id: int
     diunggah_pada: datetime
     aktivitas_id: Optional[int] = None
     project_id: Optional[int] = None
-
+    daftar_dokumen_id: Optional[int] = None # Relasi ke Checklist Item
 
 # ===================================================================
-# SKEMA UNTUK DAFTAR DOKUMEN WAJIB
+# 3. SKEMA CHECKLIST (DAFTAR DOKUMEN)
 # ===================================================================
 class DaftarDokumen(CamelModel):
     id: int
     nama_dokumen: str
-    dokumen_id: Optional[int] = None
-    dokumen_terkait: Optional[Dokumen] = None
+    status_pengecekan: bool
+    # One-to-Many: Satu item checklist punya banyak file
+    files: List[Dokumen] = []
+
+class StatusPengecekanUpdate(CamelModel):
     status_pengecekan: bool
 
 
 # ===================================================================
-# SKEMA UNTUK USER
+# 4. SKEMA USER (Partial/Embedded)
 # ===================================================================
 class UserInTeam(CamelModel):
     id: int
@@ -106,44 +104,43 @@ class UserInProject(CamelModel):
     id: int
     username: str
     nama_lengkap: Optional[str] = None
+    foto_profil_url: Optional[str] = None # Tambahkan foto profil agar tampil di card
 
-# Tambahan: Skema untuk user yang terlibat dalam aktivitas
 class UserInAktivitas(CamelModel):
     id: int
     username: str
     nama_lengkap: Optional[str] = None
     foto_profil_url: Optional[str] = None
-    jabatan_id: int
+    jabatan: Optional[Jabatan] = None # Perbaikan tipe data jabatan
 
-
-# Skema untuk Team yang akan digunakan di dalam User
+# ===================================================================
+# 5. SKEMA TEAM & PROJECT (Partial/Embedded)
+# ===================================================================
 class TeamInUser(CamelModel):
     id: int
     nama_tim: str
     valid_from: Optional[date] = None
     valid_until: Optional[date] = None
 
-# Skema ini mewarisi dari TeamInUser dan menambahkan field 'peran'
 class TeamInUserWithRole(TeamInUser):
     peran: str
 
-# Skema untuk Project yang akan digunakan di dalam User
+class TeamInProject(CamelModel):
+    id: int
+    nama_tim: str
+    ketua_tim_id: Optional[int] = None
+    warna: Optional[str] = None
+    ketua_tim: Optional[UserInTeam] = None
+
 class ProjectInUser(CamelModel):
     id: int
     nama_project: str
     project_leader_id: Optional[int] = None
     project_leader: Optional[UserInTeam] = None
-    
-# Tambahan: Skema untuk aktivitas yang akan digunakan di dalam User
-class AktivitasInUser(CamelModel):
-    id: int
-    nama_aktivitas: str
-    tanggal_mulai: Optional[date] = None
-    tanggal_selesai: Optional[date] = None
-    jam_mulai: Optional[time] = None
-    jam_selesai: Optional[time] = None
 
-# Base dan Create skema untuk User
+# ===================================================================
+# 6. SKEMA USER (Full & Create)
+# ===================================================================
 class UserBase(CamelModel):
     username: str
     nama_lengkap: Optional[str] = None
@@ -160,14 +157,11 @@ class UserBase(CamelModel):
     class Config:
         from_attributes = True
 
-    # V TAMBAHKAN BLOK VALIDATOR INI V
-
     @field_validator('nip')
     @classmethod
     def validate_nip(cls, v: Optional[str]) -> Optional[str]:
         if v is None or v == "":
             return None
-
         nip_numeric = "".join(filter(str.isdigit, v))
         if len(nip_numeric) != 18:
             raise ValueError("NIP harus 18 digit angka.")
@@ -178,7 +172,6 @@ class UserBase(CamelModel):
     def validate_nipbps(cls, v: Optional[str]) -> Optional[str]:
         if v is None or v == "":
             return None
-
         nip_numeric = "".join(filter(str.isdigit, v))
         if len(nip_numeric) != 9: 
             raise ValueError("NIP BPS harus 9 digit angka.")
@@ -187,9 +180,8 @@ class UserBase(CamelModel):
     @field_validator('nohp')
     @classmethod
     def validate_nohp(cls, v: Optional[str]) -> Optional[str]:
-        # Memanggil helper yang kita buat di atas
         return validate_phone_number(v)
-    
+
 class UserCreate(UserBase):
     password: str
     sistem_role_id: int
@@ -206,8 +198,14 @@ class UserCreate(UserBase):
             raise ValueError("Password harus mengandung angka")
         return self
 
+class AktivitasInUser(CamelModel):
+    id: int
+    nama_aktivitas: str
+    tanggal_mulai: Optional[date] = None
+    tanggal_selesai: Optional[date] = None
+    jam_mulai: Optional[time] = None
+    jam_selesai: Optional[time] = None
 
-# Skema utama untuk menampilkan User secara penuh
 class User(UserBase):
     id: int
     is_active: bool
@@ -217,8 +215,6 @@ class User(UserBase):
     created_projects: List[ProjectInUser] = []
     aktivitas: List[AktivitasInUser] = [] 
 
-
-# Skema khusus untuk endpoint "me" yang menampilkan informasi lebih detail
 class UserWithTeams(UserBase):
     id: int
     is_active: bool
@@ -230,13 +226,11 @@ class UserWithTeams(UserBase):
     created_projects: List[ProjectInUser] = []
     aktivitas: List[AktivitasInUser] = [] 
 
-
 class UserUpdate(UserBase):
     nama_lengkap: Optional[str] = None
     sistem_role_id: Optional[int] = None
     jabatan_id: Optional[int] = None
     is_active: Optional[bool] = None
-
 
 class PasswordUpdate(CamelModel):
     old_password: str
@@ -253,7 +247,6 @@ class PasswordUpdate(CamelModel):
         if not any(c.isdigit() for c in self.new_password):
             raise ValueError("Password baru harus mengandung angka")
         return self
-
 
 class UserPage(CamelModel):
     total: int
@@ -276,20 +269,39 @@ class ResetPasswordRequest(CamelModel):
     new_password: str
 
 # ===================================================================
-# SKEMA UNTUK TEAM
+# 7. SKEMA AKTIVITAS (Base & Partial)
 # ===================================================================
-class TeamInProject(CamelModel):
-    id: int
-    nama_tim: str
-    ketua_tim_id: Optional[int] = None
-    warna: Optional[str] = None
-    ketua_tim: Optional[UserInTeam] = None
+class AktivitasBase(CamelModel):
+    nama_aktivitas: str
+    deskripsi: Optional[str] = None
+    use_date_range: Optional[bool] = False
+    use_time: Optional[bool] = False
+    tanggal_mulai: Optional[date] = None
+    tanggal_selesai: Optional[date] = None
+    jam_mulai: Optional[time] = None
+    jam_selesai: Optional[time] = None
+    team_id: Optional[int] = None
+    creator_user_id: Optional[int] = None
+    project_id: Optional[int] = None
+    melibatkan_kepala: Optional[bool] = None
+    id_tim_terkait: List[int] = []
 
-class ProjectInTeam(CamelModel):
-    id: int
-    nama_project: str
-    project_leader: Optional[UserInProject] = None
-    aktivitas: List[AktivitasInTeam] = []
+class AktivitasCreate(AktivitasBase):
+    daftar_dokumen_wajib: List[str] = []
+    anggota_aktivitas_ids: List[int] = []
+
+    @model_validator(mode='before')
+    @classmethod
+    def check_required_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            use_date_range = data.get('useDateRange')
+            if not use_date_range:
+                if not data.get('tanggalMulai'):
+                    raise ValueError('Tanggal Pelaksanaan wajib diisi.')
+            elif use_date_range:
+                if not data.get('tanggalMulai') or not data.get('tanggalSelesai'):
+                    raise ValueError('Tanggal Mulai dan Tanggal Selesai wajib diisi.')
+        return data
 
 class AktivitasInTeam(CamelModel):
     id: int
@@ -302,6 +314,24 @@ class AktivitasInTeam(CamelModel):
     melibatkan_kepala: bool
     users: List[UserInAktivitas] = []
 
+# Skema Aktivitas yang digunakan di dalam Project Detail
+# PENTING: Harus menyertakan dokumen agar tidak hilang di detail project
+class ProjectAktivitas(CamelModel):
+    id: int
+    nama_aktivitas: str
+    tanggal_mulai: Optional[date] = None
+    tanggal_selesai: Optional[date] = None
+    jam_mulai: Optional[time] = None
+    jam_selesai: Optional[time] = None
+    deskripsi: Optional[str] = None
+    
+    daftar_dokumen_wajib: List[DaftarDokumen] = []
+    dokumen: List[Dokumen] = [] # <--- INI PERBAIKAN PENTING
+    users: List[UserInAktivitas] = []
+
+# ===================================================================
+# 8. SKEMA TEAM (Full)
+# ===================================================================
 class TeamBase(CamelModel):
     id: int
     nama_tim: str
@@ -309,6 +339,12 @@ class TeamBase(CamelModel):
     valid_until: Optional[date] = None
     ketua_tim_id: Optional[int] = None
     warna: Optional[str] = None
+
+class ProjectInTeam(CamelModel):
+    id: int
+    nama_project: str
+    project_leader: Optional[UserInProject] = None
+    aktivitas: List[AktivitasInTeam] = []
 
 class TeamDetail(TeamBase):
     projects: List[ProjectInTeam] = []
@@ -324,8 +360,6 @@ class TeamCreate(CamelModel):
     warna: Optional[str] = None
     operator_ids: list[int] = []
 
-
-
 class TeamUpdate(CamelModel):
     nama_tim: Optional[str] = None
     valid_from: Optional[date] = None
@@ -334,101 +368,46 @@ class TeamUpdate(CamelModel):
     warna: Optional[str] = None
     operator_ids: Optional[list[int]] = None
 
-
-# Skema utama untuk menampilkan Team secara penuh
 class Team(TeamBase):
     id: int
     ketua_tim: Optional[UserInTeam] = None
     users: List[UserInTeam] = []
 
-
 class TeamPage(CamelModel):
     total: int
     items: List[Team]
 
-
 # ===================================================================
-# SKEMA UNTUK PROJECT
+# 9. SKEMA PROJECT (Full)
 # ===================================================================
 class ProjectBase(CamelModel):
     nama_project: str
     team_id: Optional[int] = None
     project_leader_id: int
 
-
 class ProjectCreate(ProjectBase):
     pass
-
 
 class ProjectUpdate(CamelModel):
     nama_project: Optional[str] = None
     team_id: Optional[int] = None
     project_leader_id: Optional[int] = None
 
-class ProjectAktivitas(CamelModel):
-    id: int
-    nama_aktivitas: str
-    daftar_dokumen_wajib: List[DaftarDokumen] = []
-    tanggal_mulai: Optional[date] = None
-    tanggal_selesai: Optional[date] = None
-    jam_mulai: Optional[time] = None
-    jam_selesai: Optional[time] = None
-
-
 class Project(ProjectBase):
     id: int
     project_leader: Optional[UserInProject] = None
     team: Optional[TeamInProject] = None
     dokumen: List[Dokumen] = []
-    aktivitas: List[ProjectAktivitas] = []
-
+    # Menggunakan ProjectAktivitas yang sudah fix di atas
+    aktivitas: List[ProjectAktivitas] = [] 
 
 class ProjectPage(CamelModel):
     total: int
     items: List[Project]
 
-
 # ===================================================================
-# SKEMA UNTUK AKTIVITAS
+# 10. SKEMA AKTIVITAS (Full)
 # ===================================================================
-class AktivitasBase(CamelModel):
-    nama_aktivitas: str
-    deskripsi: Optional[str] = None
-    use_date_range: Optional[bool] = False
-    use_time: Optional[bool] = False
-    tanggal_mulai: Optional[date] = None
-    tanggal_selesai: Optional[date] = None
-    jam_mulai: Optional[time] = None
-    jam_selesai: Optional[time] = None
-    team_id: Optional[int] = None
-    creator_user_id: Optional[int] = None
-    project_id: Optional[int] = None
-    melibatkan_kepala: Optional[bool] = None
-
-
-class StatusPengecekanUpdate(CamelModel):
-    status_pengecekan: bool
-
-
-class AktivitasCreate(AktivitasBase):
-    daftar_dokumen_wajib: List[str] = []
-    anggota_aktivitas_ids: List[int] = []
-
-
-    @model_validator(mode='before')
-    @classmethod
-    def check_required_fields(cls, data: Any) -> Any:
-        if isinstance(data, dict):
-            use_date_range = data.get('useDateRange')
-            if not use_date_range:
-                if not data.get('tanggalMulai'):
-                    raise ValueError('Tanggal Pelaksanaan wajib diisi.')
-            elif use_date_range:
-                if not data.get('tanggalMulai') or not data.get('tanggalSelesai'):
-                    raise ValueError('Tanggal Mulai dan Tanggal Selesai wajib diisi.')
-        return data
-
-
 class Aktivitas(AktivitasBase):
     id: int
     dibuat_pada: datetime
@@ -439,6 +418,7 @@ class Aktivitas(AktivitasBase):
     dokumen: List[Dokumen] = []
     daftar_dokumen_wajib: List[DaftarDokumen] = []
     users: List[UserInAktivitas] = []
+    tim_terkait: List[Team] = [] # Relasi ke Team
 
 class AktivitasPage(CamelModel):
     total: int
@@ -449,44 +429,31 @@ class AktivitasTrendItem(CamelModel):
     activity_count: int
 
 # ===================================================================
-# SKEMA UNTUK AUTENTIKASI
+# 11. SKEMA NOTIFIKASI & TOKEN
 # ===================================================================
 class Token(CamelModel):
     access_token: str
     token_type: str
 
-
 class TokenData(BaseModel):
     username: Optional[str] = None
 
-# ===================================================================
-# SKEMA UNTUK NOTIFIKASI
-# ===================================================================
 class NotifikasiBase(CamelModel): 
-    # Kolom opsional saat notifikasi dibuat
     massage: Optional[str] = None 
     link_to: Optional[str] = None
-    
-    # Kolom wajib
     title: str
     user_id: int 
-    
-    # Foreign Keys
     related_activity_id: Optional[int] = None
     related_project_id: Optional[int] = None
-    
-    # Status
     is_read: bool = Field(default=False)
-
 
 class NotifikasiCreate(NotifikasiBase):
     pass
 
-
 class Notifikasi(NotifikasiBase):
     id: int
     created_at: datetime
-    pass
+    user: Optional[UserInTeam] = None
 
 class NotifikasiCount(CamelModel):
     count: int
@@ -495,10 +462,11 @@ class NotifikasiPage(CamelModel):
     total: int
     items: List[Notifikasi]
 
-# Rebuild model untuk mengatasi circular reference jika ada
+# Rebuild model untuk mengatasi circular reference
 Team.model_rebuild()
 User.model_rebuild()
 UserWithTeams.model_rebuild()
 TeamDetail.model_rebuild()
 Aktivitas.model_rebuild()
 Project.model_rebuild()
+ProjectAktivitas.model_rebuild()
