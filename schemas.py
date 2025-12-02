@@ -462,6 +462,38 @@ class NotifikasiPage(CamelModel):
     total: int
     items: List[Notifikasi]
 
+
+# ===================================================================
+# SKEMA UNTUK DASHBOARD (BARU)
+# ===================================================================
+class DashboardStats(CamelModel):
+    # Statistik Umum (Kepala/Admin)
+    total_pegawai: int = 0
+    total_tim: int = 0
+    
+    # Statistik Tim/Project (Ketua)
+    total_anggota_tim: int = 0
+    total_project: int = 0
+    
+    # Statistik Aktivitas (Semua)
+    total_aktivitas_bulan_ini: int = 0
+    total_aktivitas_saya: int = 0 # Khusus anggota
+
+class DashboardTodoItem(CamelModel):
+    id: int # ID dari DaftarDokumen (Checklist Item)
+    nama_dokumen: str
+    status_pengecekan: bool
+    
+    # Info Konteks
+    aktivitas_id: int
+    nama_aktivitas: str
+    tanggal_mulai: Optional[date] = None
+    nama_tim: Optional[str] = None
+    nama_project: Optional[str] = None
+    
+    # Jenis Todo: 'upload' (Anggota) atau 'validasi' (Ketua)
+    jenis_tugas: str
+    
 # Rebuild model untuk mengatasi circular reference
 Team.model_rebuild()
 User.model_rebuild()

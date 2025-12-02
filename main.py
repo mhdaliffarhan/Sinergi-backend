@@ -1120,48 +1120,57 @@ def get_aktivitas_by_team_id(team_id: int, db: Session = Depends(database.get_db
     # Mengembalikan daftar aktivitas
     return db_aktivitas
 
-@app.get("/api/aktivitas/trend", response_model=List[schemas.AktivitasTrendItem])
+@app.get("/api/aktivitas/trend")
 def get_aktivitas_trend(
     db: Session = Depends(database.get_db),
-    group_by: str = Query(..., description="Filter group: 'team' atau 'user'."),
-    group_id: int = Query(..., description="ID of the Team atau User."),
-    months: int = Query(6, description="Number of months history to retrieve.")
+    group_by: str = Query(..., description="Filter: 'team', 'user', atau 'all_teams'"),
+    group_id: Optional[int] = Query(None),
+    months: int = Query(6)
 ):
-    """Mengambil tren jumlah aktivitas per bulan untuk group_id tertentu (max 6 bulan)."""
-    
     today = date.today()
-    # Hitung tanggal mulai 6 bulan ke belakang
-    start_date = today.replace(day=1) - timedelta(days=30 * (months - 1)) 
+    start_date = today.replace(day=1) - timedelta(days=30 * (months - 1))
     
-    # 1. Build the base query for activity count grouped by year and month
+    # Logic Baru: Tren Semua Tim (Multi-Line)
+    if group_by == 'all_teams':
+        query = db.query(
+            func.to_char(models.Aktivitas.tanggal_mulai, 'YYYY-MM').label('month_year'),
+            models.Team.nama_tim,
+            func.count(models.Aktivitas.id).label('activity_count')
+        ).join(models.Team).filter(
+            models.Aktivitas.tanggal_mulai >= start_date
+        ).group_by(
+            'month_year', models.Team.nama_tim
+        ).order_by('month_year')
+        
+        results = query.all()
+        
+        # Return format raw list, nanti frontend yang mengolah pivot-nya
+        return [
+            {
+                "monthYear": row.month_year, 
+                "groupName": row.nama_tim, 
+                "activityCount": row.activity_count
+            }
+            for row in results
+        ]
+
+    # Logic Lama (Single Line)
     query = db.query(
         func.to_char(models.Aktivitas.tanggal_mulai, 'YYYY-MM').label('month_year'),
         func.count(models.Aktivitas.id).label('activity_count')
-    ).filter(
-        models.Aktivitas.tanggal_mulai >= start_date 
-    )
+    ).filter(models.Aktivitas.tanggal_mulai >= start_date)
 
-    # 2. Apply filtering based on group_by parameter
-    if group_by == 'team':
+    if group_by == 'team' and group_id:
         query = query.filter(models.Aktivitas.team_id == group_id)
-    elif group_by == 'user':
-        # Join dengan tabel perantara anggota_aktivitas_link
-        query = query.join(models.anggota_aktivitas_link).filter(
-            models.anggota_aktivitas_link.c.user_id == group_id
-        )
-    else:
-        raise HTTPException(status_code=400, detail="Parameter group_by tidak valid. Gunakan 'team' atau 'user'.")
-
-    # 3. Group the results and order by month
+    elif group_by == 'user' and group_id:
+        query = query.join(models.anggota_aktivitas_link).filter(models.anggota_aktivitas_link.c.user_id == group_id)
+    
     results = query.group_by('month_year').order_by('month_year').all()
-
-    # 4. Format output (raw data, frontend yang akan mengisi nol)
-    trend_data = [
-        {"month_year": row.month_year, "activity_count": row.activity_count}
+    
+    return [
+        {"monthYear": row.month_year, "activityCount": row.activity_count}
         for row in results
     ]
-    
-    return trend_data
 
 
 # ===================================================================
@@ -2479,24 +2488,26 @@ def get_calendar_events(
         joinedload(models.Aktivitas.team)
     )
 
-    if team_ids:
+    if team_ids is not None:
+        if team_ids.strip() == "":
+            # Jika parameter ada tapi kosong (?team_ids=), jangan tampilkan apa-apa
+            return []
+            
         try:
-            team_id_list = [int(id_str) for id_str in team_ids.split(',') if id_str.isdigit()]
-            if team_id_list:
-                # Mengambil ID pengguna dari tim yang dipilih
-                user_ids_in_teams = db.query(models.user_team_link.c.user_id).filter(
-                    models.user_team_link.c.team_id.in_(team_id_list)
-                ).all()
-                unique_user_ids = {user_id for (user_id,) in user_ids_in_teams}
-                
-                # Menemukan aktivitas yang terkait dengan anggota tim tersebut
-                query = query.join(models.anggota_aktivitas_link).filter(
-                    models.anggota_aktivitas_link.c.user_id.in_(unique_user_ids)
-                ).distinct()
+            # Bersihkan spasi dan split koma
+            id_list = [int(id_str) for id_str in team_ids.split(',') if id_str.strip().isdigit()]
+            
+            if id_list:
+                # Filter berdasarkan ID yang valid
+                query = query.filter(models.Aktivitas.team_id.in_(id_list))
+            else:
+                # Jika format salah (tidak ada angka valid), kembalikan kosong
+                return []
         except ValueError:
-            raise HTTPException(status_code=400, detail="Format team_ids tidak valid.")
+             return []
     
-    return query.all()
+    # Urutkan
+    return query.order_by(models.Aktivitas.tanggal_mulai.asc()).all()
 
 
 @app.get("/api/kalender/timeline", response_model=List[dict])
@@ -2668,6 +2679,248 @@ def get_calendar_events(
             raise HTTPException(status_code=400, detail="Format team_ids tidak valid.")
     
     return query.all()
+
+# ===================================================================
+# ENDPOINT KHUSUS DASHBOARD
+# ===================================================================
+
+@app.get("/api/dashboard/stats", response_model=schemas.DashboardStats)
+def get_dashboard_stats(
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(security.get_current_user)
+):
+    """
+    Mengembalikan statistik ringkas berdasarkan peran user.
+    """
+    stats = schemas.DashboardStats()
+    today = date.today()
+
+    # 1. LOGIKA UNTUK ADMIN / KEPALA KANTOR (Melihat Global)
+    # Asumsi: Role ID 1/2 adalah Admin/Superadmin atau Jabatan Kepala
+    if current_user.sistem_role_id in [1, 2] or current_user.jabatan_id == 1: 
+        stats.total_pegawai = db.query(models.User).filter(models.User.is_active == True).count()
+        stats.total_tim = db.query(models.Team).filter(
+            models.Team.valid_until >= today
+        ).count()
+        stats.total_aktivitas_bulan_ini = db.query(models.Aktivitas).filter(
+            extract('month', models.Aktivitas.tanggal_mulai) == today.month,
+            extract('year', models.Aktivitas.tanggal_mulai) == today.year
+        ).count()
+
+    # 2. LOGIKA UNTUK KETUA TIM (Melihat Timnya)
+    # Cek apakah user adalah ketua dari tim yang aktif
+    tim_ketua = db.query(models.Team).filter(
+        models.Team.ketua_tim_id == current_user.id,
+        models.Team.valid_until >= today
+    ).first()
+
+    if tim_ketua:
+        # Hitung anggota tim (relasi users)
+        stats.total_anggota_tim = len(tim_ketua.users)
+        
+        # Hitung project di tim ini
+        stats.total_project = db.query(models.Project).filter(
+            models.Project.team_id == tim_ketua.id
+        ).count()
+        
+        # Hitung aktivitas tim bulan ini
+        stats.total_aktivitas_bulan_ini = db.query(models.Aktivitas).filter(
+            models.Aktivitas.team_id == tim_ketua.id,
+            extract('month', models.Aktivitas.tanggal_mulai) == today.month,
+            extract('year', models.Aktivitas.tanggal_mulai) == today.year
+        ).count()
+
+    # 3. LOGIKA UNTUK ANGGOTA (Melihat Diri Sendiri)
+    # Hitung aktivitas yang melibatkan saya bulan ini
+    stats.total_aktivitas_saya = db.query(models.Aktivitas).join(
+        models.anggota_aktivitas_link
+    ).filter(
+        models.anggota_aktivitas_link.c.user_id == current_user.id,
+        extract('month', models.Aktivitas.tanggal_mulai) == today.month,
+        extract('year', models.Aktivitas.tanggal_mulai) == today.year
+    ).count()
+
+    return stats
+
+
+@app.get("/api/dashboard/todo", response_model=List[schemas.DashboardTodoItem])
+def get_dashboard_todo(
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(security.get_current_user)
+):
+    """
+    Mengembalikan daftar 'To-Do' prioritas.
+    - Untuk Anggota: Dokumen wajib yang BELUM diupload.
+    - Untuk Ketua Tim: Dokumen wajib yang SUDAH diupload tapi BELUM divalidasi.
+    """
+    todo_list = []
+    today = date.today()
+
+    # A. TUGAS ANGGOTA: Upload Dokumen yang Belum Ada
+    # Cari aktivitas aktif yang melibatkan user
+    # Lalu cari checklist item di dalamnya yang belum punya file
+    
+    # Subquery: Ambil aktivitas yang melibatkan user
+    user_activities = db.query(models.Aktivitas).join(
+        models.anggota_aktivitas_link
+    ).filter(
+        models.anggota_aktivitas_link.c.user_id == current_user.id,
+        # Opsional: Hanya aktivitas yang belum lewat jauh (misal 30 hari terakhir)
+        models.Aktivitas.tanggal_mulai >= today - timedelta(days=30) 
+    ).all()
+
+    for akt in user_activities:
+        for item in akt.daftar_dokumen_wajib:
+            # Cek apakah item ini SUDAH punya file? (menggunakan relasi 'files')
+            if not item.files: 
+                # Belum ada file -> Masukkan ke Todo List "Pending Upload"
+                todo_list.append({
+                    "id": item.id,
+                    "nama_dokumen": item.nama_dokumen,
+                    "status_pengecekan": item.status_pengecekan,
+                    "aktivitas_id": akt.id,
+                    "nama_aktivitas": akt.nama_aktivitas,
+                    "tanggal_mulai": akt.tanggal_mulai,
+                    "nama_tim": akt.team.nama_tim if akt.team else "-",
+                    "nama_project": akt.project.nama_project if akt.project else "-",
+                    "jenis_tugas": "upload" # Marker untuk frontend
+                })
+
+    # B. TUGAS KETUA TIM: Validasi Dokumen
+    # Cari tim yang dipimpin user
+    tim_ketua = db.query(models.Team).filter(
+        models.Team.ketua_tim_id == current_user.id,
+        models.Team.valid_until >= today
+    ).all()
+
+    tim_ids = [t.id for t in tim_ketua]
+    
+    if tim_ids:
+        # Cari checklist item di tim ini yang ADA file tapi BELUM divalidasi
+        pending_validation_items = db.query(models.DaftarDokumen).join(
+            models.Aktivitas
+        ).options(
+            joinedload(models.DaftarDokumen.aktivitas).joinedload(models.Aktivitas.team),
+            joinedload(models.DaftarDokumen.aktivitas).joinedload(models.Aktivitas.project),
+            joinedload(models.DaftarDokumen.files) # Load files untuk pengecekan
+        ).filter(
+            models.Aktivitas.team_id.in_(tim_ids),
+            models.DaftarDokumen.status_pengecekan == False, # Belum valid
+            models.DaftarDokumen.files.any() # TAPI sudah ada file (artinya butuh review)
+        ).limit(20).all() # Limit agar tidak kebanyakan
+
+        for item in pending_validation_items:
+            akt = item.aktivitas
+            todo_list.append({
+                "id": item.id,
+                "nama_dokumen": item.nama_dokumen,
+                "status_pengecekan": item.status_pengecekan,
+                "aktivitas_id": akt.id,
+                "nama_aktivitas": akt.nama_aktivitas,
+                "tanggal_mulai": akt.tanggal_mulai,
+                "nama_tim": akt.team.nama_tim if akt.team else "-",
+                "nama_project": akt.project.nama_project if akt.project else "-",
+                "jenis_tugas": "validasi" # Marker untuk frontend
+            })
+
+    # Sortir berdasarkan tanggal (yang paling mendesak/lama di atas)
+    # Disini kita sort desc (terbaru dulu) atau asc (terlama dulu) terserah
+    todo_list.sort(key=lambda x: x['tanggal_mulai'] or date.min, reverse=True)
+
+    return todo_list
+
+@app.get("/api/dashboard/timeline-monitor")
+def get_timeline_monitor(
+    start_date: date,
+    end_date: date,
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(security.get_current_user)
+):
+    """
+    Mengambil data untuk Timeline View: List Tim beserta Aktivitas mereka 
+    dalam rentang tanggal tertentu.
+    """
+    # 1. Ambil semua Tim Aktif
+    teams = db.query(models.Team).filter(
+        models.Team.valid_until >= date.today()
+    ).all()
+
+    result = []
+
+    for team in teams:
+        # 2. Ambil Aktivitas Tim ini yang BERIRISAN dengan range tanggal
+        # Logika Overlap: (StartA <= EndB) and (EndA >= StartB)
+        activities = db.query(models.Aktivitas).filter(
+            models.Aktivitas.team_id == team.id,
+            models.Aktivitas.tanggal_mulai <= end_date,
+            or_(
+                models.Aktivitas.tanggal_selesai >= start_date,
+                # Handle aktivitas 1 hari (tanggal_selesai null -> dianggap sama dengan tanggal_mulai)
+                and_(models.Aktivitas.tanggal_selesai.is_(None), models.Aktivitas.tanggal_mulai >= start_date)
+            )
+        ).all()
+
+        # Format aktivitas untuk frontend
+        acts_data = []
+        for act in activities:
+            # Normalisasi tanggal selesai untuk logika frontend
+            real_end = act.tanggal_selesai if act.tanggal_selesai else act.tanggal_mulai
+            
+            acts_data.append({
+                "id": act.id,
+                "namaAktivitas": act.nama_aktivitas,
+                "tanggalMulai": act.tanggal_mulai,
+                "tanggalSelesai": real_end,
+                "status": "berjalan" # Bisa dikembangkan nanti
+            })
+
+        result.append({
+            "id": team.id,
+            "namaTim": team.nama_tim,
+            "warna": team.warna or "#3b82f6", # Default blue
+            "ketua": team.ketua_tim.nama_lengkap if team.ketua_tim else "-",
+            "activities": acts_data
+        })
+
+    return result
+
+
+@app.get("/api/dashboard/team-timeline")
+def get_team_timeline_for_leader(
+    start_date: date,
+    end_date: date,
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(security.get_current_user)
+):
+    """
+    Mengambil jadwal aktivitas untuk tim yang dipimpin oleh user saat ini.
+    """
+    # 1. Cari Tim di mana user adalah Ketua
+    # Kita ambil tim yang masih aktif
+    team = db.query(models.Team).filter(
+        models.Team.ketua_tim_id == current_user.id,
+        models.Team.valid_until >= date.today()
+    ).first()
+
+    if not team:
+        return [] # User bukan ketua tim atau tim sudah tidak aktif
+
+    # 2. Ambil Aktivitas Tim dalam rentang tanggal
+    # Logika Overlap: Activity Start <= View End AND Activity End >= View Start
+    activities = db.query(models.Aktivitas).options(
+        joinedload(models.Aktivitas.project) # Load project info
+    ).filter(
+        models.Aktivitas.team_id == team.id,
+        models.Aktivitas.tanggal_mulai <= end_date,
+        or_(
+            models.Aktivitas.tanggal_selesai >= start_date,
+            # Handle aktivitas 1 hari (tanggal_selesai null dianggap sama dengan mulai)
+            and_(models.Aktivitas.tanggal_selesai.is_(None), models.Aktivitas.tanggal_mulai >= start_date)
+        )
+    ).order_by(models.Aktivitas.tanggal_mulai.asc(), models.Aktivitas.jam_mulai.asc()).all()
+    
+    # Kita return list aktivitas, grouping dilakukan di frontend agar fleksibel
+    return activities
 
 # ===================================================================
 # ENDPOINT UNTUK NOTIFKIKASI
