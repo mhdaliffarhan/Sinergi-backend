@@ -51,30 +51,45 @@ def save_file_securely(file: UploadFile) -> str:
     Menyimpan file dengan nama UUID di folder berdasarkan Tahun/Bulan.
     Returns: Relative path string (contoh: 'storage/2024/11/550e8400.pdf')
     """
-    # 1. Ekstensi File
     filename = file.filename
     ext = filename.split('.')[-1] if '.' in filename else 'bin'
-    
-    # 2. Buat Struktur Folder: storage/YYYY/MM
     now = datetime.now()
     folder_path = os.path.join(STORAGE_DIRECTORY, str(now.year), f"{now.month:02d}")
-    
     if not os.path.exists(folder_path):
         os.makedirs(folder_path, exist_ok=True)
-    
-    # 3. Generate Nama File UUID
     unique_filename = f"{uuid.uuid4()}.{ext}"
     file_path = os.path.join(folder_path, unique_filename)
-    
-    # 4. Simpan Fisik
     with open(file_path, "wb+") as file_object:
         shutil.copyfileobj(file.file, file_object)
-        
-    # 5. Return Path Relatif (untuk disimpan di DB)
-    # Kita ubah backslash windows (\) jadi forward slash (/) agar standar web
     relative_path = os.path.relpath(file_path, start=".").replace("\\", "/")
-    
     return relative_path
+
+# ===================================================================
+# FUNGSI WRAPPER WA ANTI-BOT
+# ===================================================================
+async def send_whatsapp_safe(phone_number: str, message: str, sequence_index: int = 0):
+    """
+    Mengirim pesan WA dengan jeda waktu agar tidak terdeteksi bot.
+    sequence_index: Urutan pesan dalam loop (0, 1, 2, ...).
+    """
+    # 1. Jeda Dasar: 3 sampai 5 detik per pesan antrian
+    # Jika ada 10 orang, orang ke-10 akan menerima pesan setelah +/- 30-50 detik
+    base_delay = sequence_index * random.randint(3, 5)
+    
+    # 2. Jitter (Variasi Acak): Tambahan 1-3 detik agar tidak pola mesin
+    jitter = random.uniform(1.0, 3.0)
+    
+    total_delay = base_delay + jitter
+    
+    # Tunggu secara asinkron (tidak memblokir server)
+    await asyncio.sleep(total_delay)
+    
+    try:
+        # Panggil service WA asli (pastikan services_wa menghandle error network)
+        print(f"Creating WA Task for {phone_number} with delay {total_delay:.2f}s")
+        services_wa.send_whatsapp_message(phone_number, message)
+    except Exception as e:
+        print(f"Gagal mengirim WA ke {phone_number}: {e}")
 
 def get_document_path(db: Session, project_id: Optional[int] = None, aktivitas_id: Optional[int] = None):
     """
@@ -127,7 +142,7 @@ def get_document_path(db: Session, project_id: Optional[int] = None, aktivitas_i
         folder_proyek = project.nama_project.replace(' ', '-')
 
     # Membangun jalur hierarkis
-    base_path = os.path.join(DOKUMEN_DIRECTORY, folder_tahun, folder_tim, folder_proyek)
+    base_path = os.path.join(STORAGE_DIRECTORY, folder_tahun, folder_tim, folder_proyek)
     
     if folder_aktivitas:
         base_path = os.path.join(base_path, folder_aktivitas)
@@ -143,7 +158,6 @@ def create_notification(
     title: str,
     massage: str,
     link_to: str,
-    background_tasks: BackgroundTasks,
     activity_id: Optional[int] = None,
     project_id: Optional[int] = None,
     send_whatsapp: bool = True,
@@ -168,30 +182,25 @@ def create_notification(
 
     user = db.query(models.User).filter(models.User.id == user_id).first()
 
-    # Kirim HANYA jika user punya nohp DAN send_whatsapp=True
     if user and user.nohp and send_whatsapp:
-
         base_url = "https://sinergi.statsntb.id" 
         full_link = f"{base_url}{link_to}"
         wa_message = ""
 
         if wa_message_override:
-            # GUNAKAN PESAN KUSTOM (jika ada)
-            # Kita gunakan placeholder {LINK} agar bisa diganti
             wa_message = wa_message_override.replace("{LINK}", full_link)
         else:
-            # GUNAKAN FORMAT LAMA (default)
             wa_message = f"🔔 *Notifikasi SINERGI*\n\n"
             wa_message += f"*{title}*\n"
             wa_message += f"{massage}\n\n"
             wa_message += f"Lihat detail:\n{full_link}"
 
-        # Jalankan di background
-        background_tasks.add_task(
-            services_wa.send_whatsapp_message,
+        new_queue = models.WaQueue(
             phone_number=user.nohp,
-            message=wa_message
+            message=wa_message,
+            status="pending"
         )
+        db.add(new_queue)
     
     return db_notif
 
@@ -1006,7 +1015,8 @@ def add_team_member(team_id: int, user_id: int, background_tasks: BackgroundTask
             title=title_notif, 
             massage=message_notif, 
             link_to=link_detail,
-            background_tasks=background_tasks
+            send_whatsapp=False
+            
         )
         db.commit() # Commit notifikasi ke database
         # --- END LOGIKA NOTIFIKASI ---
@@ -1045,7 +1055,7 @@ def remove_team_member(team_id: int, user_id: int, background_tasks: BackgroundT
         title=title_notif, 
         massage=message_notif, 
         link_to="/team" ,
-        background_tasks=background_tasks
+        send_whatsapp=True 
     )
     db.commit() # Commit notifikasi
     # --- END LOGIKA NOTIFIKASI ---
@@ -1178,12 +1188,12 @@ def get_aktivitas_trend(
 # ===================================================================
 
 @app.post("/api/projects", response_model=schemas.Project, response_model_by_alias=True)
-def create_project(project: schemas.ProjectCreate, background_tasks: BackgroundTasks, db: Session = Depends(database.get_db), current_user: models.User = Depends(security.get_current_user)):
+def create_project(project: schemas.ProjectCreate, db: Session = Depends(database.get_db), current_user: models.User = Depends(security.get_current_user)):
     
     team = db.query(models.Team).filter(models.Team.id == project.team_id).first()
     if not team:
         raise HTTPException(status_code=404, detail="Tim tidak ditemukan")
-
+    
     # --- LOGIKA OTORISASI BARU ---
     is_ketua_tim = team.ketua_tim_id == current_user.id
     
@@ -1201,6 +1211,7 @@ def create_project(project: schemas.ProjectCreate, background_tasks: BackgroundT
         )
     
     project_data = project.dict(by_alias=False)
+    send_wa_flag = project_data.pop('send_whatsapp', False)
     db_project = models.Project(**project_data)
     db.add(db_project)
     db.commit()
@@ -1229,29 +1240,26 @@ def create_project(project: schemas.ProjectCreate, background_tasks: BackgroundT
     
     # 4. Loop dan Kirim Notifikasi
     for user in project_with_relations.team.users:
-        if user.id == project_leader_id:
-            # Notifikasi Khusus untuk Leader
-            create_notification(
-                db, 
-                user_id=user.id, 
-                title=title_leader, 
-                massage=message_leader, 
-                link_to=link_detail, 
-                background_tasks=background_tasks,
-                project_id=db_project.id
-            )
-        else:
-            # Notifikasi Umum untuk Anggota
-            create_notification(
-                db, 
-                user_id=user.id, 
-                title=title_umum, 
-                massage=message_umum, 
-                link_to=link_detail, 
-                background_tasks=background_tasks,
-                project_id=db_project.id,
-                send_whatsapp=False
-            )
+            if user.id == project_leader_id:
+                create_notification(
+                    db=db, 
+                    user_id=user.id, 
+                    title=f"Anda Project Leader: {nama_project}", 
+                    massage="Anda telah ditunjuk sebagai Project Leader.", 
+                    link_to=link_detail, 
+                    project_id=db_project.id,
+                    send_whatsapp=send_wa_flag 
+                )
+            else:
+                create_notification(
+                    db=db, 
+                    user_id=user.id, 
+                    title=f"Project Baru: {nama_project}", 
+                    massage=f"Project baru ditambahkan di tim {project_with_relations.team.nama_tim}.", 
+                    link_to=link_detail, 
+                    project_id=db_project.id,
+                    send_whatsapp=send_wa_flag
+                )
             
     db.commit() # Commit notifikasi
     # --- END LOGIKA NOTIFIKASI ---
@@ -1471,13 +1479,14 @@ def get_public_aktivitas_detail(
 @app.post("/api/aktivitas", response_model=schemas.Aktivitas)
 def create_aktivitas(
     aktivitas: schemas.AktivitasCreate,
-    background_tasks: BackgroundTasks,
     db: Session = Depends(database.get_db),
     current_user: models.User = Depends(security.get_current_user),
 ):
     # 1. BERSIHKAN PAYLOAD
     aktivitas_payload = aktivitas.dict()
     
+    send_wa_flag = aktivitas_payload.pop('send_whatsapp', False)
+
     # Ambil dan hapus field list khusus (agar tidak error saat masuk ke models.Aktivitas)
     anggota_ids = aktivitas_payload.pop('anggota_aktivitas_ids', [])
     doc_wajib_names = aktivitas_payload.pop('daftar_dokumen_wajib', [])
@@ -1538,11 +1547,7 @@ def create_aktivitas(
         
         nama_aktivitas = aktivitas_with_relations.nama_aktivitas
         nama_tim = aktivitas_with_relations.team.nama_tim if aktivitas_with_relations.team else "Tim Tidak Diketahui"
-        
-        # V TAMBAHKAN NAMA PROYEK V
         nama_project = aktivitas_with_relations.project.nama_project if aktivitas_with_relations.project else "Tanpa Proyek"
-        # ^ AKHIR BLOK TAMBAHAN ^
-        
         link_detail = f"/aktivitas/detail/{db_aktivitas.id}"
 
         # 1. Format String Pelaksanaan (Tanggal)
@@ -1571,47 +1576,34 @@ def create_aktivitas(
         
         # --- AKHIR INFO WA ---
 
-        # Kirim notifikasi ke setiap pengguna yang terlibat
+        # Loop User (Tanpa delay index)
         for user in db_aktivitas.users:
-            
-            # --- PERBAIKAN: Template WA yang Disempurnakan ---
             wa_msg_template = (
-                f"🔔 *Notifikasi SINERGI: Aktivitas Baru*\n\n"
-                f"Halo {user.nama_lengkap}!\n"
-                f"Anda telah ditambahkan ke aktivitas baru:\n\n"
-                f"👥 *Tim*:\n{nama_tim}\n\n"
-                f"💼 *Project*:\n{nama_project}\n\n" 
-                f"📝 *Nama Aktivitas*:\n{nama_aktivitas}\n\n"
-                f"*Pelaksanaan*:\n{pelaksanaan_str}\n\n"
-                f"Lihat Detail:\n"
-                f"{{LINK}}\n\n"  # Placeholder
-                f"Aplikasi Sinergi\n" # <-- Menambahkan footer
-                f"BPS Provinsi Nusa Tenggara Barat"
+                f"🔔 *Aktivitas Baru*\n\n"
+                f"Halo {user.nama_lengkap},\n"
+                f"Anda ditambahkan ke:\n\n"
+                f"📝 *{nama_aktivitas}*\n"
+                f"Tim: {nama_tim}\n"
+                f"Project: {nama_project}\n\n"
+                f"*Waktu*: {pelaksanaan_str}\n\n" # Tambahkan jika variabel tersedia
+                f"Cek detail: {{LINK}}"
             )
             
-            # Pesan In-App (Singkat)
-            app_title = f"Aktivitas Baru: {nama_aktivitas}"
-            app_massage = f"Anda ditambahkan ke aktivitas ini oleh {current_user.nama_lengkap}."
-            
             create_notification(
-                db, 
+                db=db, 
                 user_id=user.id, 
-                title=app_title,
-                massage=app_massage,
+                title=f"Aktivitas Baru: {nama_aktivitas}",
+                massage=f"Anda ditambahkan ke aktivitas baru.",
                 link_to=link_detail,
-                background_tasks=background_tasks,
                 activity_id=db_aktivitas.id, 
                 project_id=db_aktivitas.project_id,
-                send_whatsapp=True,
-                wa_message_override=wa_msg_template # <-- Mengirim template kustom
+                send_whatsapp=send_wa_flag,
+                wa_message_override=wa_msg_template
             )
         
         db.commit()
     # END: LOGIKA PENGIRIMAN NOTIFIKASI
 
-    print(f"Aktivitas berhasil disimpan dengan ID: {db_aktivitas.id}")
-    print(f"Total anggota yang tersimpan di database: {len(db_aktivitas.users)}")
-    print("--- Proses selesai ---")
     return db_aktivitas
 
 @app.get("/api/aktivitas/download-excel", response_class=StreamingResponse)
@@ -1733,7 +1725,6 @@ def download_aktivitas_excel(
 def backup_monthly_files(
     month: int,
     year: int,
-    background_tasks: BackgroundTasks, # Penting untuk menghapus file temp setelah kirim
     db: Session = Depends(database.get_db),
     current_user: models.User = Depends(security.get_current_user)
 ):
@@ -1958,17 +1949,17 @@ def delete_aktivitas(
         )
         
         # Kirim notifikasi ke semua anggota yang terlibat
-        for user in users_terlibat:
+        for i, user in enumerate(users_terlibat):
             create_notification(
                 db, 
                 user_id=user.id, 
                 title=title_notif, 
                 massage=message_notif, 
-                background_tasks=background_tasks,
                 link_to="/dashboard", 
                 activity_id=None,
                 send_whatsapp=False
             )
+
         db.commit() # Commit notifikasi
     # --- END LOGIKA NOTIFIKASI ---
 
@@ -2123,60 +2114,60 @@ def add_link_untuk_proyek(
     return db_dokumen
 
 # --- ENDPOINT BARU UNTUK MENGGANTI FILE DI CHECKLIST ---
-@app.post("/api/checklist/{item_id}/replace", response_model=schemas.Dokumen)
-def replace_checklist_dokumen(
-    item_id: int,
-    old_file_action: str = Form(...), # Menerima 'hapus' atau 'unlink'
-    file: UploadFile = File(...),
-    db: Session = Depends(database.get_db)
-):
-    # 1. Cari item checklist yang akan diupdate
-    db_checklist_item = db.query(models.DaftarDokumen).filter(models.DaftarDokumen.id == item_id).first()
-    if not db_checklist_item:
-        raise HTTPException(status_code=404, detail="Item checklist tidak ditemukan")
+# @app.post("/api/checklist/{item_id}/replace", response_model=schemas.Dokumen)
+# def replace_checklist_dokumen(
+#     item_id: int,
+#     old_file_action: str = Form(...), # Menerima 'hapus' atau 'unlink'
+#     file: UploadFile = File(...),
+#     db: Session = Depends(database.get_db)
+# ):
+#     # 1. Cari item checklist yang akan diupdate
+#     db_checklist_item = db.query(models.DaftarDokumen).filter(models.DaftarDokumen.id == item_id).first()
+#     if not db_checklist_item:
+#         raise HTTPException(status_code=404, detail="Item checklist tidak ditemukan")
 
-    # Simpan ID dokumen lama sebelum diubah
-    old_dokumen_id = db_checklist_item.dokumen_id
+#     # Simpan ID dokumen lama sebelum diubah
+#     old_dokumen_id = db_checklist_item.dokumen_id
 
-    # 2. Simpan file baru dan buat entri dokumen baru (logika sama seperti upload)
-    file_extension = file.filename.split(".")[-1]
-    unique_filename = f"{uuid.uuid4()}.{file_extension}"
-    file_location = os.path.join(DOKUMEN_DIRECTORY, unique_filename)
-    try:
-        with open(file_location, "wb+") as file_object:
-            shutil.copyfileobj(file.file, file_object)
-    finally:
-        file.file.close()
+#     # 2. Simpan file baru dan buat entri dokumen baru (logika sama seperti upload)
+#     file_extension = file.filename.split(".")[-1]
+#     unique_filename = f"{uuid.uuid4()}.{file_extension}"
+#     file_location = os.path.join(DOKUMEN_DIRECTORY, unique_filename)
+#     try:
+#         with open(file_location, "wb+") as file_object:
+#             shutil.copyfileobj(file.file, file_object)
+#     finally:
+#         file.file.close()
     
-    new_db_dokumen = models.Dokumen(
-        aktivitas_id=db_checklist_item.aktivitas_id,
-        keterangan=db_checklist_item.nama_dokumen,
-        tipe='FILE',
-        path_atau_url=file_location,
-        nama_file_asli=file.filename,
-        tipe_file_mime=file.content_type
-    )
-    db.add(new_db_dokumen)
-    db.flush() # Gunakan flush untuk mendapatkan ID dari dokumen baru
+#     new_db_dokumen = models.Dokumen(
+#         aktivitas_id=db_checklist_item.aktivitas_id,
+#         keterangan=db_checklist_item.nama_dokumen,
+#         tipe='FILE',
+#         path_atau_url=file_location,
+#         nama_file_asli=file.filename,
+#         tipe_file_mime=file.content_type
+#     )
+#     db.add(new_db_dokumen)
+#     db.flush() # Gunakan flush untuk mendapatkan ID dari dokumen baru
 
-    # 3. Update item checklist untuk menunjuk ke dokumen baru
-    db_checklist_item.dokumen_id = new_db_dokumen.id
+#     # 3. Update item checklist untuk menunjuk ke dokumen baru
+#     db_checklist_item.dokumen_id = new_db_dokumen.id
 
-    # 4. Proses dokumen lama berdasarkan aksi yang dipilih
-    if old_dokumen_id and old_file_action == 'hapus':
-        old_db_dokumen = db.query(models.Dokumen).filter(models.Dokumen.id == old_dokumen_id).first()
-        if old_db_dokumen:
-            # Hapus file fisik
-            if os.path.exists(old_db_dokumen.path_atau_url):
-                os.remove(old_db_dokumen.path_atau_url)
-            # Hapus catatan dari database
-            db.delete(old_db_dokumen)
+#     # 4. Proses dokumen lama berdasarkan aksi yang dipilih
+#     if old_dokumen_id and old_file_action == 'hapus':
+#         old_db_dokumen = db.query(models.Dokumen).filter(models.Dokumen.id == old_dokumen_id).first()
+#         if old_db_dokumen:
+#             # Hapus file fisik
+#             if os.path.exists(old_db_dokumen.path_atau_url):
+#                 os.remove(old_db_dokumen.path_atau_url)
+#             # Hapus catatan dari database
+#             db.delete(old_db_dokumen)
     
-    # 5. Commit semua perubahan
-    db.commit()
-    db.refresh(new_db_dokumen)
+#     # 5. Commit semua perubahan
+#     db.commit()
+#     db.refresh(new_db_dokumen)
     
-    return new_db_dokumen
+#     return new_db_dokumen
 
 # --- ENDPOIN MENGHAPUS DOKUMEN ---
 @app.delete("/api/dokumen/{dokumen_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -2285,19 +2276,16 @@ def update_status_pengecekan(
         
         # B. Kirim Notifikasi ke semua Anggota Aktivitas
         if db_item.aktivitas.users:
-            for user in db_item.aktivitas.users:
-                # Kirim ke semua anggota aktivitas
+            for i, user in enumerate(db_item.aktivitas.users):
                 create_notification(
                     db,
                     user_id=user.id,
                     title=title_notif,
                     massage=message_notif,
-                    background_tasks=background_tasks,
                     link_to=link_detail,
                     activity_id=db_item.aktivitas_id,
                     send_whatsapp=False
                 )
-            db.commit()
             
     # --- END LOGIKA NOTIFIKASI ---
 
@@ -2686,6 +2674,7 @@ def get_calendar_events(
 
 @app.get("/api/dashboard/stats", response_model=schemas.DashboardStats)
 def get_dashboard_stats(
+    team_id: Optional[int] = Query(None),
     db: Session = Depends(database.get_db),
     current_user: models.User = Depends(security.get_current_user)
 ):
@@ -2714,16 +2703,40 @@ def get_dashboard_stats(
         models.Team.valid_until >= today
     ).first()
 
-    if tim_ketua:
-        # Hitung anggota tim (relasi users)
-        stats.total_anggota_tim = len(tim_ketua.users)
+    if team_id:
+        tim_ketua = db.query(models.Team).filter(
+            models.Team.id == team_id,
+            models.Team.ketua_tim_id == current_user.id
+        ).first()
+    else:
+        # Jika tidak ada filter, ambil salah satu atau semua (disini ambil pertama sbg default)
+        # Atau hitung agregat semua tim dia.
+        # Untuk simplisitas sesuai UI dashboard, kita ambil agregat jika team_id null,
+        # tapi karena UI dropdown select 'Semua Tim Saya' (value null), 
+        # sebaiknya kita hitung total dari semua tim yang diketuai.
         
-        # Hitung project di tim ini
+        tim_ketua_list = db.query(models.Team).filter(
+            models.Team.ketua_tim_id == current_user.id,
+            models.Team.valid_until >= today
+        ).all()
+        
+        # Hitung Agregat
+        stats.total_anggota_tim = sum([len(t.users) for t in tim_ketua_list])
         stats.total_project = db.query(models.Project).filter(
-            models.Project.team_id == tim_ketua.id
+            models.Project.team_id.in_([t.id for t in tim_ketua_list])
+        ).count()
+        stats.total_aktivitas_bulan_ini = db.query(models.Aktivitas).filter(
+            models.Aktivitas.team_id.in_([t.id for t in tim_ketua_list]),
+            extract('month', models.Aktivitas.tanggal_mulai) == today.month,
+            extract('year', models.Aktivitas.tanggal_mulai) == today.year
         ).count()
         
-        # Hitung aktivitas tim bulan ini
+        return stats
+
+    if tim_ketua:
+        # Jika single team dipilih
+        stats.total_anggota_tim = len(tim_ketua.users)
+        stats.total_project = db.query(models.Project).filter(models.Project.team_id == tim_ketua.id).count()
         stats.total_aktivitas_bulan_ini = db.query(models.Aktivitas).filter(
             models.Aktivitas.team_id == tim_ketua.id,
             extract('month', models.Aktivitas.tanggal_mulai) == today.month,

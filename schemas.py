@@ -269,7 +269,7 @@ class ResetPasswordRequest(CamelModel):
     new_password: str
 
 # ===================================================================
-# 7. SKEMA AKTIVITAS (Base & Partial)
+# 7. SKEMA AKTIVITAS
 # ===================================================================
 class AktivitasBase(CamelModel):
     nama_aktivitas: str
@@ -289,6 +289,7 @@ class AktivitasBase(CamelModel):
 class AktivitasCreate(AktivitasBase):
     daftar_dokumen_wajib: List[str] = []
     anggota_aktivitas_ids: List[int] = []
+    send_whatsapp: bool = True
 
     @model_validator(mode='before')
     @classmethod
@@ -386,7 +387,7 @@ class ProjectBase(CamelModel):
     project_leader_id: int
 
 class ProjectCreate(ProjectBase):
-    pass
+    send_whatsapp: bool = True
 
 class ProjectUpdate(CamelModel):
     nama_project: Optional[str] = None
@@ -406,7 +407,7 @@ class ProjectPage(CamelModel):
     items: List[Project]
 
 # ===================================================================
-# 10. SKEMA AKTIVITAS (Full)
+# 10. SKEMA AKTIVITAS
 # ===================================================================
 class Aktivitas(AktivitasBase):
     id: int

@@ -172,3 +172,16 @@ class Notifikasi(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User", back_populates="notifikasi")
+
+class WaQueue(Base):
+    __tablename__ = "wa_queue"
+
+    id = Column(Integer, primary_key=True, index=True)
+    phone_number = Column(String(50), nullable=False)
+    message = Column(Text, nullable=False)
+    status = Column(String(20), default="pending", index=True) 
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    sent_at = Column(DateTime(timezone=True), nullable=True)
+    retry_count = Column(Integer, default=0)
+    error_log = Column(Text, nullable=True)

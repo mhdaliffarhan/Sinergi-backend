@@ -15,6 +15,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from database import Base
 from models import *
+from models import Base
 
 # add your model's MetaData object here
 # for 'autogenerate' support
