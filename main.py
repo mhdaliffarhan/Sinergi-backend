@@ -3,7 +3,7 @@ from fastapi import (FastAPI, Depends, HTTPException, status, Response, File,
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy import or_, desc, and_, func, insert, select, update, extract
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 from typing import List,  Optional
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -11,9 +11,9 @@ from datetime import timedelta, date, datetime
 from openpyxl import Workbook
 from openpyxl.styles import Alignment
 from jose import JWSError, jwt
-from pydantic import BaseModel
+from pydantic import BaseModel  
 
-import models, database, schemas, security, uuid, io, os, shutil, uuid, io, zipfile, services_wa, asyncio, tempfile, re
+import models, database, schemas, security, uuid, io, os, shutil, uuid, io, zipfile, services_wa, asyncio, tempfile, re, random
 
 # ===================================================================
 # INISIALISASI & KONFIGURASI
@@ -323,7 +323,7 @@ async def get_user_from_reset_token(
         if username is None:
             raise credentials_exception
 
-    except JWTError: # Termasuk 'ExpiredSignatureError'
+    except JWSError: # Termasuk 'ExpiredSignatureError'
         raise credentials_exception
 
     user = security.get_user(db, username=username)
@@ -890,8 +890,7 @@ def get_active_teams(
     return {"total": total, "items": teams}
 
 
-@app.put("/api/teams/{team_id}", response_model=schemas.Team, response_model_by_alias=True,
-          dependencies=[Depends(security.require_role(["Superadmin", "Admin"]))])
+@app.put("/api/teams/{team_id}", response_model=schemas.Team, response_model_by_alias=True)
 def update_team(team_id: int, team_update: schemas.TeamUpdate, db: Session = Depends(database.get_db)):
     db_team = db.query(models.Team).filter(models.Team.id == team_id).first()
     if not db_team:
@@ -985,7 +984,7 @@ def get_team_details(team_id: int, db: Session = Depends(database.get_db)):
     
     return db_team
 
-@app.post("/api/teams/{team_id}/members", response_model=schemas.Team, response_model_by_alias=True, dependencies=[Depends(security.require_role(["Superadmin", "Admin" ]))])
+@app.post("/api/teams/{team_id}/members", response_model=schemas.Team, response_model_by_alias=True)
 def add_team_member(team_id: int, user_id: int, background_tasks: BackgroundTasks, db: Session = Depends(database.get_db)):
     """Menambahkan seorang pengguna ke dalam tim."""
     db_team = db.query(models.Team).filter(models.Team.id == team_id).first()
@@ -1025,7 +1024,7 @@ def add_team_member(team_id: int, user_id: int, background_tasks: BackgroundTask
 
     return db_team
 
-@app.delete("/api/teams/{team_id}/members/{user_id}", response_model=schemas.Team, response_model_by_alias=True, dependencies=[Depends(security.require_role(["Superadmin", "Admin"]))])
+@app.delete("/api/teams/{team_id}/members/{user_id}", response_model=schemas.Team, response_model_by_alias=True)
 def remove_team_member(team_id: int, user_id: int, background_tasks: BackgroundTasks, db: Session = Depends(database.get_db)):
     """Mengeluarkan seorang pengguna dari tim."""
     db_team = db.query(models.Team).filter(models.Team.id == team_id).first()
@@ -1188,7 +1187,7 @@ def get_aktivitas_trend(
 # ===================================================================
 
 @app.post("/api/projects", response_model=schemas.Project, response_model_by_alias=True)
-def create_project(project: schemas.ProjectCreate, db: Session = Depends(database.get_db), current_user: models.User = Depends(security.get_current_user)):
+def create_project(project: schemas.ProjectCreate, db: Session = Depends(database.get_db), current_user: models.User = Depends(security.get_current_user), dependencies=[Depends(security.require_role("Superadmin"))]):
     
     team = db.query(models.Team).filter(models.Team.id == project.team_id).first()
     if not team:
@@ -1196,7 +1195,8 @@ def create_project(project: schemas.ProjectCreate, db: Session = Depends(databas
     
     # --- LOGIKA OTORISASI BARU ---
     is_ketua_tim = team.ketua_tim_id == current_user.id
-    
+    is_superadmin = current_user.sistem_role.nama_role == "Superadmin"
+
     is_operator_query = select(models.user_team_link).where(
         models.user_team_link.c.user_id == current_user.id,
         models.user_team_link.c.team_id == project.team_id,
@@ -1204,7 +1204,7 @@ def create_project(project: schemas.ProjectCreate, db: Session = Depends(databas
     )
     is_operator = db.execute(is_operator_query).first() is not None
 
-    if not is_ketua_tim and not is_operator:
+    if not is_ketua_tim and not is_operator and not is_superadmin:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, 
             detail="Anda bukan Ketua Tim atau Operator untuk membuat proyek di tim ini"
@@ -1384,7 +1384,9 @@ def get_all_aktivitas(
 ):
     query = db.query(models.Aktivitas).options(
         joinedload(models.Aktivitas.creator),
-        joinedload(models.Aktivitas.team)
+        joinedload(models.Aktivitas.team),
+        # Optimasi: Preload children agar tidak N+1, tapi batasi kedalamannya
+        selectinload(models.Aktivitas.children) 
     )
 
     # Filter berdasarkan scope (Aktivitas saya / Semua)
@@ -1438,6 +1440,25 @@ def get_all_aktivitas(
     # 3. Kembalikan hasil dalam format paging
     return {"total": total, "items": aktivitas_items}
 
+@app.get("/api/aktivitas/options", response_model=List[schemas.AktivitasOption])
+def get_aktivitas_options(
+    db: Session = Depends(database.get_db),
+    q: Optional[str] = None
+):
+    """
+    Endpoint ringan untuk dropdown parent aktivitas.
+    Hanya mengembalikan ID dan Nama.
+    """
+    query = db.query(models.Aktivitas.id, models.Aktivitas.nama_aktivitas)
+    
+    if q:
+        query = query.filter(models.Aktivitas.nama_aktivitas.ilike(f"%{q}%"))
+    
+    # Batasi hasil agar tidak membebani frontend
+    results = query.limit(50).all()
+    
+    return [{"id": r.id, "nama_aktivitas": r.nama_aktivitas} for r in results]
+
 @app.get("/api/aktivitas/kepala", response_model=List[schemas.Aktivitas])
 def get_aktivitas_kepala(
     db: Session = Depends(database.get_db)):
@@ -1467,7 +1488,10 @@ def get_public_aktivitas_detail(
         joinedload(models.Aktivitas.project),
         joinedload(models.Aktivitas.team),
         joinedload(models.Aktivitas.users).joinedload(models.User.jabatan), # Load anggota & jabatan
-        joinedload(models.Aktivitas.dokumen)
+        joinedload(models.Aktivitas.dokumen),
+        # Load hierarki untuk publik juga
+        joinedload(models.Aktivitas.parent),
+        selectinload(models.Aktivitas.children)
     ).filter(models.Aktivitas.public_id == public_id).first()
 
     if not aktivitas:
@@ -1475,7 +1499,7 @@ def get_public_aktivitas_detail(
     
     # Skema 'schemas.Aktivitas' Anda akan digunakan untuk merespons
     return aktivitas
-  
+   
 @app.post("/api/aktivitas", response_model=schemas.Aktivitas)
 def create_aktivitas(
     aktivitas: schemas.AktivitasCreate,
@@ -1498,6 +1522,9 @@ def create_aktivitas(
     # Hapus field helper form
     aktivitas_payload.pop('use_date_range', None)
     aktivitas_payload.pop('use_time', None)
+
+    # Validasi Parent ID (Mencegah Self-Reference saat create - meski ID belum ada, good practice)
+    # Tidak perlu validasi ID karena create baru pasti ID belum ada
 
     # 2. BUAT INSTANCE AKTIVITAS
     db_aktivitas = models.Aktivitas(**aktivitas_payload)
@@ -1628,7 +1655,7 @@ def download_aktivitas_excel(
         query = query.filter(extract('year', models.Aktivitas.tanggal_mulai) == year)
 
     # Ambil semua data
-    aktivitas_list = query.order_by(models.Aktivitas.tanggal_mulai.desc()).all()
+    aktivitas_list = query.order_by(models.Aktivitas.tanggal_mulai.asc()).all()
 
     # Buat File Excel
     wb = Workbook()
@@ -1636,7 +1663,7 @@ def download_aktivitas_excel(
     ws.title = "Daftar Aktivitas"
     
     # --- HEADER (DIREVISI SESUAI PERMINTAAN) ---
-    # Urutan: No, Waktu (4 kolom), Nama, Proyek, Tim, Link
+    # Urutan: No, Waktu (4 kolom), Nama, Proyek, Tim, Link, Status, Parent
     headers = [
         "No",
         "Tanggal Mulai", 
@@ -1644,6 +1671,8 @@ def download_aktivitas_excel(
         "Jam Mulai", 
         "Jam Selesai", 
         "Nama Aktivitas", 
+        "Status", # Baru
+        "Parent", # Baru
         "Nama Proyek", 
         "Tim", 
         "Bukti Dukung (Link)"
@@ -1673,15 +1702,17 @@ def download_aktivitas_excel(
 
         # --- APPEND ROW (URUTAN BARU) ---
         row_data = [
-            index,           # Kolom A: No
-            tgl_mulai_str,   # Kolom B: Tgl Mulai
+            index,            # Kolom A: No
+            tgl_mulai_str,    # Kolom B: Tgl Mulai
             tgl_selesai_str, # Kolom C: Tgl Selesai
-            jam_mulai_str,   # Kolom D: Jam Mulai
+            jam_mulai_str,    # Kolom D: Jam Mulai
             jam_selesai_str, # Kolom E: Jam Selesai
             aktivitas.nama_aktivitas, # Kolom F: Nama
-            project_name,    # Kolom G: Proyek
-            team_name,       # Kolom H: Tim
-            link             # Kolom I: Link
+            aktivitas.status, # Kolom G: Status
+            aktivitas.parent.nama_aktivitas if aktivitas.parent else "-", # Kolom H: Parent
+            project_name,    # Kolom I: Proyek
+            team_name,        # Kolom J: Tim
+            link              # Kolom K: Link
         ]
         ws.append(row_data)
         
@@ -1700,9 +1731,11 @@ def download_aktivitas_excel(
         'D': 10, # Jam Mulai
         'E': 10, # Jam Selesai
         'F': 40, # Nama Aktivitas (Lebar)
-        'G': 30, # Proyek
-        'H': 25, # Tim
-        'I': 50  # Link (Paling Lebar)
+        'G': 15, # Status
+        'H': 25, # Parent
+        'I': 30, # Proyek
+        'J': 25, # Tim
+        'K': 50  # Link (Paling Lebar)
     }
     for col_letter, width in column_widths.items():
         ws.column_dimensions[col_letter].width = width
@@ -1820,11 +1853,14 @@ def backup_monthly_files(
 def get_aktivitas_by_id(aktivitas_id: int, db: Session = Depends(database.get_db)):
     # Query database untuk mencari aktivitas dengan ID yang sesuai
     db_aktivitas = db.query(models.Aktivitas).options(
-        joinedload(models.Aktivitas.dokumen),   
+        joinedload(models.Aktivitas.dokumen),    
         joinedload(models.Aktivitas.daftar_dokumen_wajib),
         joinedload(models.Aktivitas.team),
         joinedload(models.Aktivitas.tim_terkait),
-        joinedload(models.Aktivitas.users)
+        joinedload(models.Aktivitas.users),
+        # --- NEW: LOAD PARENT & CHILDREN ---
+        joinedload(models.Aktivitas.parent),
+        selectinload(models.Aktivitas.children) # selectinload lebih efisien untuk collection
     ).filter(models.Aktivitas.id == aktivitas_id).first()
     
     # Jika aktivitas tidak ditemukan, kirim error 404
@@ -1838,7 +1874,7 @@ def get_aktivitas_by_id(aktivitas_id: int, db: Session = Depends(database.get_db
 @app.put("/api/aktivitas/{aktivitas_id}", response_model=schemas.Aktivitas)
 def update_aktivitas(
     aktivitas_id: int, 
-    aktivitas: schemas.AktivitasCreate, 
+    aktivitas: schemas.AktivitasUpdate, # Ganti jadi Update Schema yang opsional
     db: Session = Depends(database.get_db), 
     current_user: models.User = Depends(security.get_current_user)
 ):
@@ -1857,18 +1893,29 @@ def update_aktivitas(
     # 1. Ambil Data Payload
     update_data = aktivitas.dict(exclude_unset=True)
     
-    # Pisahkan data relasi
-    anggota_ids = update_data.pop('anggota_aktivitas_ids', None)
-    doc_wajib_names = update_data.pop('daftar_dokumen_wajib', None)
-    tim_terkait_ids = update_data.pop('id_tim_terkait', None) # <-- AMBIL ID BARU
+    # Validasi Parent: Tidak boleh menjadi parent diri sendiri
+    if 'parent_id' in update_data and update_data['parent_id'] == aktivitas_id:
+        raise HTTPException(status_code=400, detail="Aktivitas tidak bisa menjadi induk bagi dirinya sendiri.")
 
-    # Bersihkan field helper
+    # Pisahkan data relasi (field ini tidak ada di tabel aktivitas langsung)
+    # Karena kita pakai AktivitasUpdate (base), field relasi ini mungkin tidak ada
+    # Anda harus memastikan FE mengirim field relasi jika ingin update relasi
+    # Atau gunakan schema Create jika ingin full replace.
+    # Asumsi: Jika field ada di payload, kita update.
+    
+    # Hapus field helper
     update_data.pop('use_date_range', None)
     update_data.pop('use_time', None)
     
-    # 2. Update Field Dasar (Nama, Deskripsi, Tanggal, dll)
+    # Pisahkan relasi (jika ada)
+    anggota_ids = update_data.pop('anggota_aktivitas_ids', None)
+    doc_wajib_names = update_data.pop('daftar_dokumen_wajib', None)
+    tim_terkait_ids = update_data.pop('id_tim_terkait', None) 
+
+    # 2. Update Field Dasar (Nama, Deskripsi, Tanggal, Status, KalenderView, ParentID)
     for key, value in update_data.items():
-        setattr(db_aktivitas, key, value)
+        if hasattr(db_aktivitas, key):
+            setattr(db_aktivitas, key, value)
     
     # 3. Update Anggota (Many-to-Many)
     if anggota_ids is not None:
@@ -1876,14 +1923,10 @@ def update_aktivitas(
         db_aktivitas.users = [] 
         if anggota_ids:
             unique_ids = list(set(anggota_ids))
-            # Tambahkan kepala kantor jika opsi dipilih (opsional, logic ada di frontend biasanya)
-            # if aktivitas.melibatkan_kepala: ...
-            
             users_to_add = db.query(models.User).filter(models.User.id.in_(unique_ids)).all()
             db_aktivitas.users.extend(users_to_add)
     
     # 4. Update Dokumen Wajib (One-to-Many)
-    # Logika: Hapus yang tidak ada di list baru, tambah yang baru
     if doc_wajib_names is not None:
         current_docs = {d.nama_dokumen: d for d in db_aktivitas.daftar_dokumen_wajib}
         new_docs_set = set(doc_wajib_names)
@@ -1900,13 +1943,10 @@ def update_aktivitas(
                     models.DaftarDokumen(nama_dokumen=name, status_pengecekan=False)
                 )
 
-    # 5. Update Tim Terkait (Many-to-Many) - LOGIKA BARU
+    # 5. Update Tim Terkait (Many-to-Many)
     if tim_terkait_ids is not None:
-        # Bersihkan relasi lama
         db_aktivitas.tim_terkait = []
-        
         unique_tim_ids = list(set(tim_terkait_ids))
-        # Hindari memasukkan tim penyelenggara sendiri
         if db_aktivitas.team_id in unique_tim_ids:
             unique_tim_ids.remove(db_aktivitas.team_id)
             
@@ -2113,62 +2153,6 @@ def add_link_untuk_proyek(
     
     return db_dokumen
 
-# --- ENDPOINT BARU UNTUK MENGGANTI FILE DI CHECKLIST ---
-# @app.post("/api/checklist/{item_id}/replace", response_model=schemas.Dokumen)
-# def replace_checklist_dokumen(
-#     item_id: int,
-#     old_file_action: str = Form(...), # Menerima 'hapus' atau 'unlink'
-#     file: UploadFile = File(...),
-#     db: Session = Depends(database.get_db)
-# ):
-#     # 1. Cari item checklist yang akan diupdate
-#     db_checklist_item = db.query(models.DaftarDokumen).filter(models.DaftarDokumen.id == item_id).first()
-#     if not db_checklist_item:
-#         raise HTTPException(status_code=404, detail="Item checklist tidak ditemukan")
-
-#     # Simpan ID dokumen lama sebelum diubah
-#     old_dokumen_id = db_checklist_item.dokumen_id
-
-#     # 2. Simpan file baru dan buat entri dokumen baru (logika sama seperti upload)
-#     file_extension = file.filename.split(".")[-1]
-#     unique_filename = f"{uuid.uuid4()}.{file_extension}"
-#     file_location = os.path.join(DOKUMEN_DIRECTORY, unique_filename)
-#     try:
-#         with open(file_location, "wb+") as file_object:
-#             shutil.copyfileobj(file.file, file_object)
-#     finally:
-#         file.file.close()
-    
-#     new_db_dokumen = models.Dokumen(
-#         aktivitas_id=db_checklist_item.aktivitas_id,
-#         keterangan=db_checklist_item.nama_dokumen,
-#         tipe='FILE',
-#         path_atau_url=file_location,
-#         nama_file_asli=file.filename,
-#         tipe_file_mime=file.content_type
-#     )
-#     db.add(new_db_dokumen)
-#     db.flush() # Gunakan flush untuk mendapatkan ID dari dokumen baru
-
-#     # 3. Update item checklist untuk menunjuk ke dokumen baru
-#     db_checklist_item.dokumen_id = new_db_dokumen.id
-
-#     # 4. Proses dokumen lama berdasarkan aksi yang dipilih
-#     if old_dokumen_id and old_file_action == 'hapus':
-#         old_db_dokumen = db.query(models.Dokumen).filter(models.Dokumen.id == old_dokumen_id).first()
-#         if old_db_dokumen:
-#             # Hapus file fisik
-#             if os.path.exists(old_db_dokumen.path_atau_url):
-#                 os.remove(old_db_dokumen.path_atau_url)
-#             # Hapus catatan dari database
-#             db.delete(old_db_dokumen)
-    
-#     # 5. Commit semua perubahan
-#     db.commit()
-#     db.refresh(new_db_dokumen)
-    
-#     return new_db_dokumen
-
 # --- ENDPOIN MENGHAPUS DOKUMEN ---
 @app.delete("/api/dokumen/{dokumen_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_dokumen(dokumen_id: int, db: Session = Depends(database.get_db)):
@@ -2365,7 +2349,7 @@ def download_all_project_documents(
         joinedload(models.Project.dokumen), # Dokumen level project
         joinedload(models.Project.aktivitas).joinedload(models.Aktivitas.dokumen).joinedload(models.Dokumen.checklist_item)
     ).filter(models.Project.id == project_id).first()
-     
+      
     if not project:
         raise HTTPException(status_code=404, detail="Proyek tidak ditemukan")
 
@@ -2469,34 +2453,23 @@ def get_calendar_events(
 ):
     """
     Mengambil daftar semua aktivitas yang relevan untuk tampilan kalender.
-    Jika team_ids diberikan, akan memfilter berdasarkan anggota tim.
+    Hanya mengembalikan aktivitas yang kalender_view == True.
+    Jika team_ids diberikan, akan memfilter berdasarkan tim tersebut.
     """
     query = db.query(models.Aktivitas).options(
         joinedload(models.Aktivitas.users),
         joinedload(models.Aktivitas.team)
-    )
+    ).filter(models.Aktivitas.kalender_view == True) # <--- FILTER WAJIB
 
-    if team_ids is not None:
-        if team_ids.strip() == "":
-            # Jika parameter ada tapi kosong (?team_ids=), jangan tampilkan apa-apa
-            return []
-            
+    if team_ids:
         try:
-            # Bersihkan spasi dan split koma
-            id_list = [int(id_str) for id_str in team_ids.split(',') if id_str.strip().isdigit()]
-            
-            if id_list:
-                # Filter berdasarkan ID yang valid
-                query = query.filter(models.Aktivitas.team_id.in_(id_list))
-            else:
-                # Jika format salah (tidak ada angka valid), kembalikan kosong
-                return []
+            team_id_list = {int(id_str) for id_str in team_ids.split(',') if id_str.isdigit()}
+            if team_id_list:
+                query = query.filter(models.Aktivitas.team_id.in_(team_id_list))
         except ValueError:
-             return []
+            raise HTTPException(status_code=400, detail="Format team_ids tidak valid.")
     
-    # Urutkan
-    return query.order_by(models.Aktivitas.tanggal_mulai.asc()).all()
-
+    return query.all()
 
 @app.get("/api/kalender/timeline", response_model=List[dict])
 def get_timeline_data(
@@ -2507,11 +2480,13 @@ def get_timeline_data(
 ):
     """
     Mengambil data timeline yang sudah diolah dari backend, termasuk penugasan lane.
+    Hanya aktivitas dengan kalender_view == True.
     """
     query = db.query(models.Aktivitas).options(
         joinedload(models.Aktivitas.users).joinedload(models.User.jabatan),
         joinedload(models.Aktivitas.team)
     ).filter(
+        models.Aktivitas.kalender_view == True, # <--- FILTER WAJIB
         or_(
             and_(
                 models.Aktivitas.tanggal_mulai <= end_date,
@@ -2684,8 +2659,10 @@ def get_dashboard_stats(
     stats = schemas.DashboardStats()
     today = date.today()
 
+    # -----------------------------------------------------------
     # 1. LOGIKA UNTUK ADMIN / KEPALA KANTOR (Melihat Global)
-    # Asumsi: Role ID 1/2 adalah Admin/Superadmin atau Jabatan Kepala
+    # -----------------------------------------------------------
+    # Asumsi: Role ID 1/2 adalah Admin/Superadmin atau Jabatan Kepala (ID 1)
     if current_user.sistem_role_id in [1, 2] or current_user.jabatan_id == 1: 
         stats.total_pegawai = db.query(models.User).filter(models.User.is_active == True).count()
         stats.total_tim = db.query(models.Team).filter(
@@ -2696,62 +2673,75 @@ def get_dashboard_stats(
             extract('year', models.Aktivitas.tanggal_mulai) == today.year
         ).count()
 
+    # -----------------------------------------------------------
     # 2. LOGIKA UNTUK KETUA TIM (Melihat Timnya)
-    # Cek apakah user adalah ketua dari tim yang aktif
-    tim_ketua = db.query(models.Team).filter(
+    # -----------------------------------------------------------
+    # Ambil semua tim yang dipimpin oleh user ini
+    tim_ketua_list = db.query(models.Team).filter(
         models.Team.ketua_tim_id == current_user.id,
         models.Team.valid_until >= today
-    ).first()
+    ).all()
 
-    if team_id:
-        tim_ketua = db.query(models.Team).filter(
-            models.Team.id == team_id,
-            models.Team.ketua_tim_id == current_user.id
-        ).first()
-    else:
-        # Jika tidak ada filter, ambil salah satu atau semua (disini ambil pertama sbg default)
-        # Atau hitung agregat semua tim dia.
-        # Untuk simplisitas sesuai UI dashboard, kita ambil agregat jika team_id null,
-        # tapi karena UI dropdown select 'Semua Tim Saya' (value null), 
-        # sebaiknya kita hitung total dari semua tim yang diketuai.
-        
-        tim_ketua_list = db.query(models.Team).filter(
-            models.Team.ketua_tim_id == current_user.id,
-            models.Team.valid_until >= today
-        ).all()
-        
-        # Hitung Agregat
-        stats.total_anggota_tim = sum([len(t.users) for t in tim_ketua_list])
-        stats.total_project = db.query(models.Project).filter(
-            models.Project.team_id.in_([t.id for t in tim_ketua_list])
-        ).count()
-        stats.total_aktivitas_bulan_ini = db.query(models.Aktivitas).filter(
-            models.Aktivitas.team_id.in_([t.id for t in tim_ketua_list]),
-            extract('month', models.Aktivitas.tanggal_mulai) == today.month,
-            extract('year', models.Aktivitas.tanggal_mulai) == today.year
-        ).count()
-        
-        return stats
+    # Hanya jalankan perhitungan ketua tim jika user memang memimpin tim
+    if tim_ketua_list:
+        if team_id:
+            # KASUS A: Filter Spesifik Satu Tim
+            # Pastikan team_id yang diminta memang milik user ini
+            target_tim = next((t for t in tim_ketua_list if t.id == team_id), None)
+            
+            if target_tim:
+                # Hitung anggota via tabel link untuk akurasi
+                stats.total_anggota_tim = db.query(models.user_team_link).filter(
+                    models.user_team_link.c.team_id == target_tim.id
+                ).count()
+                
+                stats.total_project = db.query(models.Project).filter(
+                    models.Project.team_id == target_tim.id
+                ).count()
+                
+                stats.total_aktivitas_bulan_ini = db.query(models.Aktivitas).filter(
+                    models.Aktivitas.team_id == target_tim.id,
+                    extract('month', models.Aktivitas.tanggal_mulai) == today.month,
+                    extract('year', models.Aktivitas.tanggal_mulai) == today.year
+                ).count()
+        else:
+            # KASUS B: Agregat Semua Tim Saya
+            managed_team_ids = [t.id for t in tim_ketua_list]
+            
+            # Hitung total anggota unik (jika perlu) atau total membership
+            stats.total_anggota_tim = db.query(models.user_team_link).filter(
+                models.user_team_link.c.team_id.in_(managed_team_ids)
+            ).count()
+            
+            stats.total_project = db.query(models.Project).filter(
+                models.Project.team_id.in_(managed_team_ids)
+            ).count()
+            
+            stats.total_aktivitas_bulan_ini = db.query(models.Aktivitas).filter(
+                models.Aktivitas.team_id.in_(managed_team_ids),
+                extract('month', models.Aktivitas.tanggal_mulai) == today.month,
+                extract('year', models.Aktivitas.tanggal_mulai) == today.year
+            ).count()
 
-    if tim_ketua:
-        # Jika single team dipilih
-        stats.total_anggota_tim = len(tim_ketua.users)
-        stats.total_project = db.query(models.Project).filter(models.Project.team_id == tim_ketua.id).count()
-        stats.total_aktivitas_bulan_ini = db.query(models.Aktivitas).filter(
-            models.Aktivitas.team_id == tim_ketua.id,
-            extract('month', models.Aktivitas.tanggal_mulai) == today.month,
-            extract('year', models.Aktivitas.tanggal_mulai) == today.year
-        ).count()
-
-    # 3. LOGIKA UNTUK ANGGOTA (Melihat Diri Sendiri)
-    # Hitung aktivitas yang melibatkan saya bulan ini
-    stats.total_aktivitas_saya = db.query(models.Aktivitas).join(
-        models.anggota_aktivitas_link
-    ).filter(
-        models.anggota_aktivitas_link.c.user_id == current_user.id,
-        extract('month', models.Aktivitas.tanggal_mulai) == today.month,
-        extract('year', models.Aktivitas.tanggal_mulai) == today.year
-    ).count()
+    # -----------------------------------------------------------
+    # 3. LOGIKA UNTUK ANGGOTA (Aktivitas Saya)
+    # -----------------------------------------------------------
+    # Bagian ini HARUS dijalankan untuk SEMUA user (Pegawai, Ketua, Admin)
+    # agar widget "Aktivitas Saya" selalu muncul isinya.
+    
+    stats.total_aktivitas_saya = (
+        db.query(models.Aktivitas)
+        .join(
+            models.anggota_aktivitas_link,
+            models.Aktivitas.id == models.anggota_aktivitas_link.c.aktivitas_id
+        )
+        .filter(
+            models.anggota_aktivitas_link.c.user_id == current_user.id,
+            extract("month", models.Aktivitas.tanggal_mulai) == today.month,
+            extract("year", models.Aktivitas.tanggal_mulai) == today.year,
+        )
+        .count()
+    )
 
     return stats
 
@@ -2865,6 +2855,7 @@ def get_timeline_monitor(
         # Logika Overlap: (StartA <= EndB) and (EndA >= StartB)
         activities = db.query(models.Aktivitas).filter(
             models.Aktivitas.team_id == team.id,
+            models.Aktivitas.kalender_view == True, 
             models.Aktivitas.tanggal_mulai <= end_date,
             or_(
                 models.Aktivitas.tanggal_selesai >= start_date,
@@ -2924,6 +2915,7 @@ def get_team_timeline_for_leader(
         joinedload(models.Aktivitas.project) # Load project info
     ).filter(
         models.Aktivitas.team_id == team.id,
+        models.Aktivitas.kalender_view == True, # <--- FILTER WAJIB
         models.Aktivitas.tanggal_mulai <= end_date,
         or_(
             models.Aktivitas.tanggal_selesai >= start_date,

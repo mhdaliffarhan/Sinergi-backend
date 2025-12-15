@@ -4,6 +4,8 @@ from sqlalchemy.sql import func
 from sqlalchemy.dialects.postgresql import UUID
 from database import Base
 
+# --- LINK TABLES ---
+
 user_team_link = Table('user_team_link', Base.metadata,
     Column('user_id', Integer, ForeignKey('users.id'), primary_key=True),
     Column('team_id', Integer, ForeignKey('teams.id'), primary_key=True),
@@ -21,6 +23,8 @@ aktivitas_tim_terkait_link = Table(
     Column("aktivitas_id", Integer, ForeignKey("aktivitas.id"), primary_key=True),
     Column("team_id", Integer, ForeignKey("teams.id"), primary_key=True),
 )
+
+# --- MODELS ---
 
 class Team(Base):
     __tablename__ = "teams"
@@ -69,18 +73,29 @@ class Aktivitas(Base):
     jam_mulai = Column(Time, nullable=True)
     jam_selesai = Column(Time, nullable=True)
     dibuat_pada = Column(TIMESTAMP(timezone=True), server_default='now()')
+    
     creator_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     team_id = Column(Integer, ForeignKey("teams.id"), nullable=True)
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
     melibatkan_kepala = Column(Boolean, default=False, nullable=False)
+    parent_id = Column(Integer, ForeignKey("aktivitas.id"), nullable=True, index=True)
+    kalender_view = Column(Boolean, default=True, nullable=False, index=True) 
+    status = Column(String(50), default='Belum Selesai', nullable=False, index=True)
 
+    # Relationships
     creator = relationship("User", back_populates="created_aktivitas")
     team = relationship("Team", back_populates="aktivitas")
     project = relationship("Project", back_populates="aktivitas")
+    
     dokumen = relationship("Dokumen", back_populates="aktivitas", cascade="all, delete-orphan")
     daftar_dokumen_wajib = relationship("DaftarDokumen", back_populates="aktivitas", cascade="all, delete-orphan")
     users = relationship("User", secondary=anggota_aktivitas_link, back_populates="aktivitas", cascade="all, delete")
     tim_terkait = relationship("Team", secondary=aktivitas_tim_terkait_link, back_populates='aktivitas_terkait')
+
+    # Self-Referential Relationships (Parent <-> Children)
+    # remote_side=[id] menandakan bahwa kolom 'parent_id' di tabel ini merujuk ke kolom 'id' di tabel yang SAMA
+    parent = relationship("Aktivitas", remote_side=[id], back_populates="children")
+    children = relationship("Aktivitas", back_populates="parent", cascade="all, delete-orphan")
 
 class Dokumen(Base):
     __tablename__ = "dokumen"
@@ -137,7 +152,6 @@ class User(Base):
     # Info Kontak (untuk WA)
     nohp = Column(String(20), nullable=True, unique=True, index=True)
 
-    
     sistem_role = relationship("SistemRole")
     jabatan = relationship("Jabatan")
     teams = relationship("Team", secondary=user_team_link, back_populates="users")

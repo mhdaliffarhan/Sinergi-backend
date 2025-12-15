@@ -205,6 +205,8 @@ class AktivitasInUser(CamelModel):
     tanggal_selesai: Optional[date] = None
     jam_mulai: Optional[time] = None
     jam_selesai: Optional[time] = None
+    # Tambahan agar di profil terlihat statusnya
+    status: str = 'Belum Selesai' 
 
 class User(UserBase):
     id: int
@@ -285,6 +287,19 @@ class AktivitasBase(CamelModel):
     project_id: Optional[int] = None
     melibatkan_kepala: Optional[bool] = None
     id_tim_terkait: List[int] = []
+    
+    # --- FITUR BARU ---
+    status: str = 'Belum Selesai'
+    parent_id: Optional[int] = None
+    kalender_view: bool = True
+
+    @field_validator('status')
+    @classmethod
+    def validate_status(cls, v):
+        valid_statuses = ['Belum Selesai', 'Dalam Proses', 'Selesai']
+        if v and v not in valid_statuses:
+            raise ValueError(f"Status harus salah satu dari: {', '.join(valid_statuses)}")
+        return v
 
 class AktivitasCreate(AktivitasBase):
     daftar_dokumen_wajib: List[str] = []
@@ -304,6 +319,13 @@ class AktivitasCreate(AktivitasBase):
                     raise ValueError('Tanggal Mulai dan Tanggal Selesai wajib diisi.')
         return data
 
+class AktivitasUpdate(AktivitasBase):
+    # Optional semua field untuk PATCH/PUT partial
+    nama_aktivitas: Optional[str] = None
+    status: Optional[str] = None
+    kalender_view: Optional[bool] = None
+    parent_id: Optional[int] = None
+
 class AktivitasInTeam(CamelModel):
     id: int
     nama_aktivitas: str
@@ -313,7 +335,25 @@ class AktivitasInTeam(CamelModel):
     jam_mulai: Optional[time] = None
     jam_selesai: Optional[time] = None
     melibatkan_kepala: bool
+    status: str
     users: List[UserInAktivitas] = []
+
+# Skema Ringan untuk Dropdown Parent (Efisiensi)
+class AktivitasOption(CamelModel):
+    id: int
+    nama_aktivitas: str
+
+# Skema Aktivitas Anak (Nested)
+class AktivitasChild(CamelModel):
+    id: int
+    nama_aktivitas: str
+    tanggal_mulai: Optional[date] = None
+    status: str = 'Belum Selesai'
+
+# Skema Aktivitas Induk (Parent Info)
+class AktivitasParent(CamelModel):
+    id: int
+    nama_aktivitas: str
 
 # Skema Aktivitas yang digunakan di dalam Project Detail
 # PENTING: Harus menyertakan dokumen agar tidak hilang di detail project
@@ -325,6 +365,7 @@ class ProjectAktivitas(CamelModel):
     jam_mulai: Optional[time] = None
     jam_selesai: Optional[time] = None
     deskripsi: Optional[str] = None
+    status: str = 'Belum Selesai' # Tambahan
     
     daftar_dokumen_wajib: List[DaftarDokumen] = []
     dokumen: List[Dokumen] = [] # <--- INI PERBAIKAN PENTING
@@ -420,6 +461,10 @@ class Aktivitas(AktivitasBase):
     daftar_dokumen_wajib: List[DaftarDokumen] = []
     users: List[UserInAktivitas] = []
     tim_terkait: List[Team] = [] # Relasi ke Team
+    
+    # --- HIERARKI ---
+    parent: Optional[AktivitasParent] = None
+    children: List[AktivitasChild] = []
 
 class AktivitasPage(CamelModel):
     total: int
@@ -478,7 +523,7 @@ class DashboardStats(CamelModel):
     
     # Statistik Aktivitas (Semua)
     total_aktivitas_bulan_ini: int = 0
-    total_aktivitas_saya: int = 0 # Khusus anggota
+    total_aktivitas_saya: int = 0
 
 class DashboardTodoItem(CamelModel):
     id: int # ID dari DaftarDokumen (Checklist Item)
