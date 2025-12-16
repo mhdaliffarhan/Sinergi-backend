@@ -153,6 +153,7 @@ class UserBase(CamelModel):
     status_kepegawaian: Optional[str] = None
     jenis_kelamin: Optional[str] = None
     nohp: Optional[str] = None
+    last_login: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -227,6 +228,7 @@ class UserWithTeams(UserBase):
     ketua_tim_aktif: List[TeamInUser] = []
     created_projects: List[ProjectInUser] = []
     aktivitas: List[AktivitasInUser] = [] 
+    last_login: Optional[datetime] = None
 
 class UserUpdate(UserBase):
     nama_lengkap: Optional[str] = None

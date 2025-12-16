@@ -93,7 +93,6 @@ class Aktivitas(Base):
     tim_terkait = relationship("Team", secondary=aktivitas_tim_terkait_link, back_populates='aktivitas_terkait')
 
     # Self-Referential Relationships (Parent <-> Children)
-    # remote_side=[id] menandakan bahwa kolom 'parent_id' di tabel ini merujuk ke kolom 'id' di tabel yang SAMA
     parent = relationship("Aktivitas", remote_side=[id], back_populates="children")
     children = relationship("Aktivitas", back_populates="parent", cascade="all, delete-orphan")
 
@@ -151,6 +150,9 @@ class User(Base):
 
     # Info Kontak (untuk WA)
     nohp = Column(String(20), nullable=True, unique=True, index=True)
+    
+    # [BARU] Timestamp Last Login
+    last_login = Column(DateTime(timezone=True), nullable=True)
 
     sistem_role = relationship("SistemRole")
     jabatan = relationship("Jabatan")

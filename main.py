@@ -258,6 +258,12 @@ def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db:
             headers={"WWW-Authenticate": "Bearer"},
         )
     
+    # --- UPDATE LAST LOGIN ---
+    user.last_login = func.now() 
+    db.add(user)
+    db.commit()
+    db.refresh(user) 
+
     # Akses Token (30 Menit)
     access_token_expires = timedelta(minutes=security.ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = security.create_access_token(
@@ -645,7 +651,8 @@ def get_all_users(
             "tmt_jab": user.tmt_jab,
             "status_kepegawaian": user.status_kepegawaian,
             "jenis_kelamin": user.jenis_kelamin,
-            "nohp": user.nohp
+            "nohp": user.nohp,
+            "last_login": user.last_login
         }
         processed_users.append(user_dict)
 
