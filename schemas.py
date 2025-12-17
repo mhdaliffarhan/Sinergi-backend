@@ -23,10 +23,10 @@ def validate_phone_number(nohp: Optional[str]) -> Optional[str]:
     if nohp_numeric.startswith('08'):
         nohp_numeric = '62' + nohp_numeric[1:]
 
-    # 3. Cek Aturan: Harus '62' dan 11-14 digit total (Sesuai revisi terakhir)
-    if not re.match(r"^62\d{9,12}$", nohp_numeric):
+    # 3. Cek Aturan: Harus '62' dan 7-14 digit total (Sesuai revisi terakhir)
+    if not re.match(r"^62\d{5,12}$", nohp_numeric):
          raise ValueError(
-            "Nomor HP harus diawali 62 dan memiliki 11-14 digit (misal: 62812...)"
+            "Nomor HP harus diawali 62 dan memiliki 8-14 digit (misal: 62812...)"
          )
 
     return nohp_numeric

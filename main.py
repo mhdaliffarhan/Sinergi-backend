@@ -545,7 +545,7 @@ def update_own_profile(
         "tmt_jab": current_user.tmt_jab,
         "status_kepegawaian": current_user.status_kepegawaian,
         "jenis_kelamin": current_user.jenis_kelamin,
-        "nohp": current_user.nohp, # <-- data ini akan ter-update
+        "nohp": current_user.nohp,
         "created_projects": current_user.created_projects,
         "aktivitas": current_user.aktivitas,
         "teams": teams_with_role,
