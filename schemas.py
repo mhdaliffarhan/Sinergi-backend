@@ -24,7 +24,7 @@ def validate_phone_number(nohp: Optional[str]) -> Optional[str]:
         nohp_numeric = '62' + nohp_numeric[1:]
 
     # 3. Cek Aturan: Harus '62' dan 7-14 digit total (Sesuai revisi terakhir)
-    if not re.match(r"^62\d{5,12}$", nohp_numeric):
+    if not re.match(r"^62\d{6,13}$", nohp_numeric):
          raise ValueError(
             "Nomor HP harus diawali 62 dan memiliki 8-14 digit (misal: 62812...)"
          )
@@ -251,6 +251,9 @@ class PasswordUpdate(CamelModel):
         if not any(c.isdigit() for c in self.new_password):
             raise ValueError("Password baru harus mengandung angka")
         return self
+    
+class AdminResetPasswordRequest(CamelModel):
+    new_password: str
 
 class UserPage(CamelModel):
     total: int
@@ -324,9 +327,12 @@ class AktivitasCreate(AktivitasBase):
 class AktivitasUpdate(AktivitasBase):
     # Optional semua field untuk PATCH/PUT partial
     nama_aktivitas: Optional[str] = None
+    daftar_dokumen_wajib: List[str] = []
+    anggota_aktivitas_ids: List[int] = []
     status: Optional[str] = None
     kalender_view: Optional[bool] = None
     parent_id: Optional[int] = None
+    send_whatsapp: bool = True
 
 class AktivitasInTeam(CamelModel):
     id: int

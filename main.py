@@ -258,6 +258,15 @@ def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db:
             headers={"WWW-Authenticate": "Bearer"},
         )
     
+    # --- VALIDASI STATUS AKTIF (BARU) ---
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, # 403 Forbidden lebih tepat untuk user non-aktif
+            detail="Akun Anda dinonaktifkan. Silakan hubungi Admin.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    # ------------------------------------
+    
     # --- UPDATE LAST LOGIN ---
     user.last_login = func.now() 
     db.add(user)
@@ -355,7 +364,6 @@ def refresh_access_token(
         "accessToken": access_token,
         "tokenType": "bearer"
     }
-# ... (kode lainnya) ...
 
 @app.get("/users/me", response_model=schemas.UserWithTeams, response_model_by_alias=True)
 def read_users_me(current_user: models.User = Depends(security.get_current_user), db: Session = Depends(database.get_db)):
@@ -414,6 +422,7 @@ def read_users_me(current_user: models.User = Depends(security.get_current_user)
     }
     
     return response_data
+
 
 @app.post("/api/{user_id}/upload-photo")
 def upload_profile_photo(user_id: int, file: UploadFile = File(...), db: Session = Depends(database.get_db)):
@@ -783,6 +792,36 @@ def create_team(team: schemas.TeamCreate, db: Session = Depends(database.get_db)
     db.refresh(db_team)
     
     return db_team
+
+@app.put("/api/admin/users/{user_id}/reset-password", dependencies=[Depends(security.require_role(["Superadmin", "Admin"]))])
+def admin_reset_password(
+    user_id: int,
+    payload: schemas.AdminResetPasswordRequest,
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(security.get_current_user)
+):
+    """
+    Endpoint khusus untuk Admin mereset password user lain.
+    """
+    # 1. Cari user target
+    target_user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User tidak ditemukan")
+
+    # 2. Validasi Password (Sama seperti UserCreate)
+    password = payload.new_password
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="Password harus minimal 8 karakter")
+    # Tambahkan validasi kompleksitas lain jika perlu
+
+    # 3. Hash Password Baru
+    hashed_password = security.get_password_hash(password)
+    target_user.hashed_password = hashed_password
+    
+    # 4. Simpan
+    db.commit()
+    
+    return {"message": f"Password untuk pengguna {target_user.username} berhasil direset."}
 
 @app.post("/api/auth/forgot-password")
 def request_password_reset(
@@ -1616,9 +1655,9 @@ def create_aktivitas(
                 f"🔔 *Aktivitas Baru*\n\n"
                 f"Halo {user.nama_lengkap},\n"
                 f"Anda ditambahkan ke:\n\n"
-                f"📝 *{nama_aktivitas}*\n"
-                f"Tim: {nama_tim}\n"
-                f"Project: {nama_project}\n\n"
+                f"📌 *{nama_aktivitas}*\n"
+                f"🏢 Tim: {nama_tim}\n"
+                f"🚀 Project: {nama_project}\n\n"
                 f"*Waktu*: {pelaksanaan_str}\n\n" # Tambahkan jika variabel tersedia
                 f"Cek detail: {{LINK}}"
             )
@@ -1881,17 +1920,19 @@ def get_aktivitas_by_id(aktivitas_id: int, db: Session = Depends(database.get_db
 @app.put("/api/aktivitas/{aktivitas_id}", response_model=schemas.Aktivitas)
 def update_aktivitas(
     aktivitas_id: int, 
-    aktivitas: schemas.AktivitasUpdate, # Ganti jadi Update Schema yang opsional
+    aktivitas: schemas.AktivitasUpdate, 
     db: Session = Depends(database.get_db), 
     current_user: models.User = Depends(security.get_current_user)
 ):
-    """Memperbarui aktivitas beserta relasinya (Anggota, Dokumen Wajib, Tim Terkait)."""
+    """Memperbarui aktivitas beserta relasinya dan mengirim notifikasi perubahan anggota."""
     
-    # Load aktivitas dengan semua relasi agar bisa di-update
+    # Load aktivitas dengan semua relasi
     db_aktivitas = db.query(models.Aktivitas).options(
         joinedload(models.Aktivitas.daftar_dokumen_wajib),
         joinedload(models.Aktivitas.users),
-        joinedload(models.Aktivitas.tim_terkait) # Load relasi ini
+        joinedload(models.Aktivitas.tim_terkait),
+        joinedload(models.Aktivitas.team),    # Load untuk info notifikasi
+        joinedload(models.Aktivitas.project)  # Load untuk info notifikasi
     ).filter(models.Aktivitas.id == aktivitas_id).first()
     
     if db_aktivitas is None:
@@ -1900,57 +1941,149 @@ def update_aktivitas(
     # 1. Ambil Data Payload
     update_data = aktivitas.dict(exclude_unset=True)
     
-    # Validasi Parent: Tidak boleh menjadi parent diri sendiri
+    # Ambil flag send_whatsapp (default False jika tidak dikirim)
+    send_wa_flag = update_data.pop('send_whatsapp', False)
+
+    # Validasi Parent
     if 'parent_id' in update_data and update_data['parent_id'] == aktivitas_id:
         raise HTTPException(status_code=400, detail="Aktivitas tidak bisa menjadi induk bagi dirinya sendiri.")
 
-    # Pisahkan data relasi (field ini tidak ada di tabel aktivitas langsung)
-    # Karena kita pakai AktivitasUpdate (base), field relasi ini mungkin tidak ada
-    # Anda harus memastikan FE mengirim field relasi jika ingin update relasi
-    # Atau gunakan schema Create jika ingin full replace.
-    # Asumsi: Jika field ada di payload, kita update.
-    
-    # Hapus field helper
+    # Bersihkan field helper
     update_data.pop('use_date_range', None)
     update_data.pop('use_time', None)
     
-    # Pisahkan relasi (jika ada)
+    # Pisahkan data relasi
     anggota_ids = update_data.pop('anggota_aktivitas_ids', None)
     doc_wajib_names = update_data.pop('daftar_dokumen_wajib', None)
     tim_terkait_ids = update_data.pop('id_tim_terkait', None) 
 
-    # 2. Update Field Dasar (Nama, Deskripsi, Tanggal, Status, KalenderView, ParentID)
+    # 2. Update Field Dasar
     for key, value in update_data.items():
         if hasattr(db_aktivitas, key):
             setattr(db_aktivitas, key, value)
     
-    # 3. Update Anggota (Many-to-Many)
+    # 3. Update Anggota & Deteksi Perubahan (LOGIKA UTAMA)
     if anggota_ids is not None:
-        # Reset list users
-        db_aktivitas.users = [] 
-        if anggota_ids:
-            unique_ids = list(set(anggota_ids))
-            users_to_add = db.query(models.User).filter(models.User.id.in_(unique_ids)).all()
-            db_aktivitas.users.extend(users_to_add)
+        old_user_ids = {u.id for u in db_aktivitas.users}
+        new_user_ids = set(anggota_ids)
+        
+        # Hitung Diff
+        added_ids = new_user_ids - old_user_ids
+        removed_ids = old_user_ids - new_user_ids
+        
+        # Lakukan Update DB
+        if new_user_ids:
+            users_to_add = db.query(models.User).filter(models.User.id.in_(list(new_user_ids))).all()
+            db_aktivitas.users = users_to_add # Replace all relations
+        else:
+            db_aktivitas.users = []
+
+        # --- LOGIKA NOTIFIKASI PERUBAHAN ---
+        if send_wa_flag:
+            # --- KUMPULKAN INFO LENGKAP (Sama seperti create_aktivitas) ---
+            nama_aktivitas = db_aktivitas.nama_aktivitas
+            nama_tim = db_aktivitas.team.nama_tim if db_aktivitas.team else "Tim Tidak Diketahui"
+            nama_project = db_aktivitas.project.nama_project if db_aktivitas.project else "Tanpa Proyek"
+            link_detail = f"/aktivitas/detail/{db_aktivitas.id}"
+
+            # Format Waktu
+            pelaksanaan_str = ""
+            tgl_mulai = db_aktivitas.tanggal_mulai
+            tgl_selesai = db_aktivitas.tanggal_selesai
+            
+            if tgl_mulai:
+                pelaksanaan_str = f"🗓️ *Tanggal:* {tgl_mulai.strftime('%d %B %Y')}"
+                if tgl_selesai and tgl_selesai != tgl_mulai:
+                    pelaksanaan_str += f" - {tgl_selesai.strftime('%d %B %Y')}"
+            else:
+                pelaksanaan_str = "🗓️ *Tanggal:* Belum ditentukan"
+
+            jam_mulai = db_aktivitas.jam_mulai
+            jam_selesai = db_aktivitas.jam_selesai
+            
+            if jam_mulai:
+                jam_str = f"⏰ *Waktu:* {jam_mulai.strftime('%H.%M')}"
+                if jam_selesai:
+                    jam_str += f" - {jam_selesai.strftime('%H.%M')} WITA"
+                else:
+                    jam_str += " WITA"
+                pelaksanaan_str += f"\n{jam_str}"
+
+            # Deskripsi
+            deskripsi_str = ""
+            if db_aktivitas.deskripsi:
+                 desc_text = db_aktivitas.deskripsi
+                 if len(desc_text) > 100:
+                     desc_text = desc_text[:100] + "..."
+                 deskripsi_str = f"\n📝 *Deskripsi:*\n_{desc_text}_\n"
+
+            # Dokumen Wajib (Ambil dari DB karena mungkin baru diupdate di langkah 4, tapi kita ambil current state dulu atau update list local)
+            # Untuk simplifikasi, kita ambil dari db_aktivitas yang ada di sesi (mungkin belum ter-refresh list dokumennya jika diupdate di bawah)
+            # Tapi info dokumen biasanya kurang kritikal dibanding waktu/tempat untuk notif 'diundang'.
+            
+            # A. Notifikasi untuk User yang DITAMBAHKAN (Format Lengkap)
+            for uid in added_ids:
+                user = db.query(models.User).filter(models.User.id == uid).first()
+                if user:
+                    wa_msg_add = (
+                        f"🔔 *Aktivitas Baru*\n\n"
+                        f"Halo {user.nama_lengkap},\n"
+                        f"Anda ditambahkan ke:\n\n"
+                        f"📌 *{nama_aktivitas}*\n"
+                        f"🏢 Tim: {nama_tim}\n"
+                        f"🚀 Project: {nama_project}\n\n"
+                        f"*Waktu*: {pelaksanaan_str}\n\n"
+                        f"Cek detail: {{LINK}}"
+                    )
+                    
+                    create_notification(
+                        db=db, user_id=uid, 
+                        title=f"Ditambahkan: {nama_aktivitas}",
+                        massage="Anda ditambahkan ke aktivitas ini.",
+                        link_to=link_detail,
+                        activity_id=db_aktivitas.id,
+                        project_id=db_aktivitas.project_id,
+                        send_whatsapp=True,
+                        wa_message_override=wa_msg_add
+                    )
+
+            # B. Notifikasi untuk User yang DIHAPUS (Format Informatif)
+            for uid in removed_ids:
+                user = db.query(models.User).filter(models.User.id == uid).first()
+                if user:
+                    wa_msg_remove = (
+                        f"ℹ️ *Update Aktivitas*\n\n"
+                        f"Halo {user.nama_lengkap},\n"
+                        f"Anda telah dikeluarkan dari aktivitas:\n"
+                        f"❌ *{nama_aktivitas}*\n\n"
+                        f"Anda tidak lagi terlibat dalam aktivitas tersebut."
+                    )
+                    create_notification(
+                        db=db, user_id=uid, 
+                        title=f"Dikeluarkan: {nama_aktivitas}",
+                        massage="Anda telah dikeluarkan dari aktivitas ini.",
+                        link_to="#", 
+                        activity_id=None,
+                        send_whatsapp=True,
+                        wa_message_override=wa_msg_remove
+                    )
     
-    # 4. Update Dokumen Wajib (One-to-Many)
+    # 4. Update Dokumen Wajib
     if doc_wajib_names is not None:
         current_docs = {d.nama_dokumen: d for d in db_aktivitas.daftar_dokumen_wajib}
         new_docs_set = set(doc_wajib_names)
         
-        # Hapus
         for name, doc_obj in list(current_docs.items()):
             if name not in new_docs_set:
                 db.delete(doc_obj)
         
-        # Tambah
         for name in new_docs_set:
             if name not in current_docs:
                 db_aktivitas.daftar_dokumen_wajib.append(
                     models.DaftarDokumen(nama_dokumen=name, status_pengecekan=False)
                 )
 
-    # 5. Update Tim Terkait (Many-to-Many)
+    # 5. Update Tim Terkait
     if tim_terkait_ids is not None:
         db_aktivitas.tim_terkait = []
         unique_tim_ids = list(set(tim_terkait_ids))
