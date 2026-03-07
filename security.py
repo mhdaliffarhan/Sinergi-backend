@@ -10,6 +10,14 @@ from sqlalchemy.orm import Session, joinedload
 # Impor dari file proyek Anda
 import models, schemas, database
 
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+SSO_CLIENT_ID = os.getenv("SSO_CLIENT_ID")
+SSO_CLIENT_SECRET = os.getenv("SSO_CLIENT_SECRET")
+
 # ===================================================================
 # KONFIGURASI KEAMANAN
 # ===================================================================
@@ -23,6 +31,8 @@ PASSWORD_RESET_EXPIRE_MINUTES = 15
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+
 
 # ===================================================================
 # FUNGSI-FUNGSI UTILITAS KEAMANAN

@@ -13,7 +13,7 @@ from openpyxl.styles import Alignment
 from jose import JWSError, jwt
 from pydantic import BaseModel  
 
-import models, database, schemas, security, uuid, io, os, shutil, uuid, io, zipfile, services_wa, asyncio, tempfile, re, random
+import models, database, schemas, security, uuid, httpx, io, os, shutil, uuid, io, zipfile, services_wa, asyncio, tempfile, re, random
 
 # ===================================================================
 # INISIALISASI & KONFIGURASI
@@ -22,8 +22,9 @@ models.Base.metadata.create_all(bind=database.engine)
 app = FastAPI()
 
 origins = [
-    "*"
-    ]
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
 
 app.add_middleware(
     CORSMiddleware,
@@ -248,6 +249,8 @@ def add_dokumen_to_zip(zip_file, dokumen_list, base_folder_path=""):
 # ===================================================================
 # ENDPOINT OTENTIKASI & PENGGUNA
 # ===================================================================
+
+
 @app.post("/token")
 def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(database.get_db)):
     user = security.get_user(db, username=form_data.username)
@@ -364,6 +367,127 @@ def refresh_access_token(
         "accessToken": access_token,
         "tokenType": "bearer"
     }
+# --- Tambahkan Model untuk Request SSO ---
+class SSOCallbackRequest(BaseModel):
+    code: str
+
+# ===================================================================
+# ENDPOINT SSO PROVINSI NTB
+# ===================================================================
+
+@app.get("/api/auth/sso/login")
+def get_sso_login_url():
+    """
+    Menghasilkan URL login SSO untuk diarahkan oleh Frontend.
+    """
+    base_url = os.getenv("SSO_BASE_URL")
+    client_id = os.getenv("SSO_CLIENT_ID")
+    redirect_uri = os.getenv("SSO_REDIRECT_URI")
+    
+    # Menyiapkan query parameter untuk OAuth2
+    query_params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": ""  # Kosongkan jika tidak ada scope khusus
+    }
+    
+    from urllib.parse import urlencode
+    login_url = f"{base_url}/oauth/authorize?{urlencode(query_params)}"
+    
+    return {"url": login_url}
+
+
+@app.post("/api/auth/sso/callback")
+async def sso_callback(request: SSOCallbackRequest, db: Session = Depends(database.get_db)):
+    try:
+        SSO_BASE_URL = os.getenv("SSO_BASE_URL")
+        CLIENT_ID = os.getenv("SSO_CLIENT_ID")
+        CLIENT_SECRET = os.getenv("SSO_CLIENT_SECRET")
+        REDIRECT_URI = os.getenv("SSO_REDIRECT_URI")
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+
+            # 1️⃣ Tukar Authorization Code → Access Token
+            token_res = await client.post(
+                f"{SSO_BASE_URL}/oauth/token",
+                data={
+                    "grant_type": "authorization_code",
+                    "client_id": CLIENT_ID,
+                    "client_secret": CLIENT_SECRET,
+                    "redirect_uri": REDIRECT_URI,
+                    "code": request.code,
+                },
+            )
+
+            if token_res.status_code != 200:
+                raise HTTPException(status_code=401, detail="SSO token exchange gagal")
+
+            sso_access_token = token_res.json().get("access_token")
+
+            # 2️⃣ Ambil Profil User dari SSO
+            user_res = await client.get(
+                f"{SSO_BASE_URL}/api/me",
+                headers={"Authorization": f"Bearer {sso_access_token}"},
+            )
+
+            if user_res.status_code != 200:
+                raise HTTPException(status_code=401, detail="Gagal mengambil profil user dari SSO")
+
+            user_data = user_res.json()
+            sso_user = user_data.get("user", user_data)
+
+        # 3️⃣ Mapping data user
+        username = sso_user.get("username")
+        pegawai = sso_user.get("pegawai", {})
+
+        if not username:
+            raise HTTPException(status_code=400, detail="Data user SSO tidak valid")
+
+        nama_lengkap = pegawai.get("nama_lengkap") or sso_user.get("name") or username
+        nip_sso = pegawai.get("nip_bps")
+
+        # 4️⃣ Cari user lokal
+        local_user = db.query(models.User).filter_by(username=username).first()
+
+        if not local_user:
+            # Auto provisioning
+            local_user = models.User(
+                username=username,
+                nama_lengkap=nama_lengkap,
+                nip=nip_sso,
+                sistem_role_id=3,
+                jabatan_id=2,
+                is_active=True,
+                hashed_password=security.get_password_hash(str(uuid.uuid4())),
+                last_login=datetime.now(),
+            )
+            db.add(local_user)
+
+        else:
+            # Sinkronisasi profil
+            local_user.nama_lengkap = nama_lengkap
+            local_user.nip = nip_sso
+            local_user.last_login = datetime.now()
+
+        db.commit()
+
+        # 5️⃣ Generate JWT lokal
+        access_token = security.create_access_token(
+            data={"sub": username},
+            expires_delta=timedelta(minutes=security.ACCESS_TOKEN_EXPIRE_MINUTES),
+        )
+
+        return {
+            "accessToken": access_token,
+            "tokenType": "bearer",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("SSO Error:", e)
+        raise HTTPException(status_code=500, detail="Internal Server Error")
 
 @app.get("/users/me", response_model=schemas.UserWithTeams, response_model_by_alias=True)
 def read_users_me(current_user: models.User = Depends(security.get_current_user), db: Session = Depends(database.get_db)):
