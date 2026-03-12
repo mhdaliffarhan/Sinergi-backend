@@ -318,7 +318,7 @@ class AktivitasBase(CamelModel):
     @field_validator('status')
     @classmethod
     def validate_status(cls, v):
-        valid_statuses = ['Belum Selesai', 'Dalam Proses', 'Selesai']
+        valid_statuses = ['Belum Selesai', 'Dalam Proses', 'Menunggu Validasi', 'Selesai', 'Dibatalkan']
         if v and v not in valid_statuses:
             raise ValueError(f"Status harus salah satu dari: {', '.join(valid_statuses)}")
         return v
@@ -489,6 +489,12 @@ class Aktivitas(AktivitasBase):
     users: List[UserInAktivitas] = []
     tim_terkait: List[Team] = [] # Relasi ke Team
     reminders: List[Reminder] = [] # <--- BARU
+
+    # --- VALIDATION FIELDS ---
+    validated_by_id: Optional[int] = None
+    validated_at: Optional[datetime] = None
+    catatan_validator: Optional[str] = None
+    validator: Optional[UserInTeam] = None
     
     # --- HIERARKI ---
     parent: Optional[AktivitasParent] = None
@@ -536,6 +542,30 @@ class NotifikasiPage(CamelModel):
     total: int
     items: List[Notifikasi]
 
+class LeaderboardEntry(CamelModel):
+    user_id: int
+    nama_lengkap: str
+    foto_profil_url: Optional[str] = None
+    upload_count: int
+
+class WrappedTeamEntry(CamelModel):
+    nama_tim: str
+    count: int
+
+class WrappedProjectEntry(CamelModel):
+    nama_project: str
+    count: int
+
+class DashboardWrapped(CamelModel):
+    year: int
+    month: int
+    total_aktivitas_tahun_ini: int
+    total_aktivitas_bulan_ini: int
+    aktivitas_per_tim: List[WrappedTeamEntry]
+    top_projects: List[WrappedProjectEntry]
+    kontribusi_dokumen_persen: float
+
+
 
 # ===================================================================
 # SKEMA UNTUK DASHBOARD (BARU)
@@ -552,6 +582,10 @@ class DashboardStats(CamelModel):
     # Statistik Aktivitas (Semua)
     total_aktivitas_bulan_ini: int = 0
     total_aktivitas_saya: int = 0
+    butuh_validasi: int = 0
+
+    # Statistik per Status
+    status_counts: dict = {}
 
 class DashboardTodoItem(CamelModel):
     id: int # ID dari DaftarDokumen (Checklist Item)
@@ -567,6 +601,13 @@ class DashboardTodoItem(CamelModel):
     
     # Jenis Todo: 'upload' (Anggota) atau 'validasi' (Ketua)
     jenis_tugas: str
+
+class AktivitasStatusUpdate(CamelModel):
+    status: str
+
+class AktivitasValidationRequest(CamelModel):
+    approved: bool
+    catatan: Optional[str] = None
     
 # Rebuild model untuk mengatasi circular reference
 Team.model_rebuild()

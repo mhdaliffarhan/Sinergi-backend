@@ -81,9 +81,15 @@ class Aktivitas(Base):
     parent_id = Column(Integer, ForeignKey("aktivitas.id"), nullable=True, index=True)
     kalender_view = Column(Boolean, default=True, nullable=False, index=True) 
     status = Column(String(50), default='Belum Selesai', nullable=False, index=True)
+    
+    # Validation Fields
+    validated_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    validated_at = Column(DateTime(timezone=True), nullable=True)
+    catatan_validator = Column(Text, nullable=True)
 
     # Relationships
-    creator = relationship("User", back_populates="created_aktivitas")
+    creator = relationship("User", back_populates="created_aktivitas", foreign_keys=[creator_user_id])
+    validator = relationship("User", back_populates="validated_aktivitas", foreign_keys=[validated_by_id])
     team = relationship("Team", back_populates="aktivitas")
     project = relationship("Project", back_populates="aktivitas")
     
@@ -106,6 +112,9 @@ class Dokumen(Base):
     nama_file_asli = Column(String, nullable=True)
     tipe_file_mime = Column(String, nullable=True)
     diunggah_pada = Column(DateTime, server_default=func.now())
+    
+    creator_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    creator = relationship("User", back_populates="uploaded_documents")
     
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
     project = relationship("Project", back_populates="dokumen")
@@ -158,10 +167,12 @@ class User(Base):
     sistem_role = relationship("SistemRole")
     jabatan = relationship("Jabatan")
     teams = relationship("Team", secondary=user_team_link, back_populates="users")
-    created_aktivitas = relationship("Aktivitas", back_populates="creator")
+    created_aktivitas = relationship("Aktivitas", back_populates="creator", foreign_keys="[Aktivitas.creator_user_id]")
+    validated_aktivitas = relationship("Aktivitas", back_populates="validator", foreign_keys="[Aktivitas.validated_by_id]")
     created_projects = relationship("Project", back_populates="project_leader")
     aktivitas = relationship("Aktivitas", secondary=anggota_aktivitas_link, back_populates="users")
     notifikasi = relationship("Notifikasi", back_populates="user") 
+    uploaded_documents = relationship("Dokumen", back_populates="creator")
 
 class SistemRole(Base):
     __tablename__ = "sistem_roles"

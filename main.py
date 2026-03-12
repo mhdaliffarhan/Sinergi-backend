@@ -1490,6 +1490,95 @@ def get_all_projects(
     projects = query.order_by(models.Project.id.asc()).offset(skip).limit(limit).all()
     return {"total": total, "items": projects}
 
+@app.get("/api/dashboard/leaderboard", response_model=List[schemas.LeaderboardEntry])
+def get_document_leaderboard(db: Session = Depends(database.get_db)):
+    """Menampilkan 10 pengguna dengan pengunggahan dokumen terbanyak."""
+    results = db.query(
+        models.User.id,
+        models.User.nama_lengkap,
+        models.User.foto_profil_url,
+        func.count(models.Dokumen.id).label('upload_count')
+    ).join(models.Dokumen, models.User.id == models.Dokumen.creator_user_id, isouter=True
+    ).group_by(models.User.id
+    ).order_by(desc('upload_count')
+    ).limit(10).all()
+    
+    return [
+        schemas.LeaderboardEntry(
+            user_id=r.id,
+            nama_lengkap=r.nama_lengkap,
+            foto_profil_url=f"/api/users/{r.id}/profile-picture" if r.foto_profil_url else None,
+            upload_count=r.upload_count
+        ) for r in results
+    ]
+
+@app.get("/api/dashboard/wrapped", response_model=schemas.DashboardWrapped)
+def get_dashboard_wrapped(
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(security.get_current_user)
+):
+    """Data rekap untuk fitur Wrapped."""
+    today = date.today()
+    start_of_year = date(today.year, 1, 1)
+    start_of_month = date(today.year, today.month, 1)
+
+    # 1. Total Aktivitas
+    total_year = db.query(models.Aktivitas).join(models.anggota_aktivitas_link).filter(
+        models.anggota_aktivitas_link.c.user_id == current_user.id,
+        models.Aktivitas.tanggal_mulai >= start_of_year
+    ).count()
+
+    total_month = db.query(models.Aktivitas).join(models.anggota_aktivitas_link).filter(
+        models.anggota_aktivitas_link.c.user_id == current_user.id,
+        models.Aktivitas.tanggal_mulai >= start_of_month
+    ).count()
+
+    # 2. Per Tim
+    per_tim_results = db.query(
+        models.Team.nama_tim,
+        func.count(models.Aktivitas.id).label('count')
+    ).join(models.Aktivitas, models.Team.id == models.Aktivitas.team_id
+    ).join(models.anggota_aktivitas_link, models.Aktivitas.id == models.anggota_aktivitas_link.c.aktivitas_id
+    ).filter(
+        models.anggota_aktivitas_link.c.user_id == current_user.id,
+        models.Aktivitas.tanggal_mulai >= start_of_year
+    ).group_by(models.Team.nama_tim).all()
+
+    # 3. Top 3 Projects
+    top_projects_results = db.query(
+        models.Project.nama_project,
+        func.count(models.Aktivitas.id).label('count')
+    ).join(models.Aktivitas, models.Project.id == models.Aktivitas.project_id
+    ).join(models.anggota_aktivitas_link, models.Aktivitas.id == models.anggota_aktivitas_link.c.aktivitas_id
+    ).filter(
+        models.anggota_aktivitas_link.c.user_id == current_user.id,
+        models.Aktivitas.tanggal_mulai >= start_of_year
+    ).group_by(models.Project.nama_project).order_by(desc('count')).limit(3).all()
+
+    # 4. Kontribusi Dokumen
+    total_docs_required = db.query(models.DaftarDokumen).join(models.Aktivitas).join(models.anggota_aktivitas_link).filter(
+        models.anggota_aktivitas_link.c.user_id == current_user.id,
+        models.Aktivitas.tanggal_mulai >= start_of_month
+    ).count()
+
+    fulfilled_docs = db.query(models.DaftarDokumen).join(models.Aktivitas).join(models.anggota_aktivitas_link).filter(
+        models.anggota_aktivitas_link.c.user_id == current_user.id,
+        models.Aktivitas.tanggal_mulai >= start_of_month,
+        models.DaftarDokumen.status_pengecekan == True
+    ).count()
+
+    contribution_percent = (fulfilled_docs / total_docs_required * 100) if total_docs_required > 0 else 0
+
+    return schemas.DashboardWrapped(
+        year=today.year,
+        month=today.month,
+        total_aktivitas_tahun_ini=total_year,
+        total_aktivitas_bulan_ini=total_month,
+        aktivitas_per_tim=[schemas.WrappedTeamEntry(nama_tim=r.nama_tim, count=r.count) for r in per_tim_results],
+        top_projects=[schemas.WrappedProjectEntry(nama_project=r.nama_project, count=r.count) for r in top_projects_results],
+        kontribusi_dokumen_persen=round(contribution_percent, 1)
+    )
+
 @app.get("/api/projects/{project_id}", response_model=schemas.Project, response_model_by_alias=True)
 def get_project_by_id(project_id: int, db: Session = Depends(database.get_db)):
     """Mendapatkan detail proyek dan daftar aktivitas aktif yang relevan."""
@@ -1591,6 +1680,7 @@ def get_all_aktivitas(
     query = db.query(models.Aktivitas).options(
         joinedload(models.Aktivitas.creator),
         joinedload(models.Aktivitas.team),
+        joinedload(models.Aktivitas.project), # <-- ADDED
         # Optimasi: Preload children agar tidak N+1, tapi batasi kedalamannya
         selectinload(models.Aktivitas.children) 
     )
@@ -2104,6 +2194,7 @@ def get_aktivitas_by_id(aktivitas_id: int, db: Session = Depends(database.get_db
         joinedload(models.Aktivitas.dokumen),    
         joinedload(models.Aktivitas.daftar_dokumen_wajib),
         joinedload(models.Aktivitas.team),
+        joinedload(models.Aktivitas.project), # <-- ADDED
         joinedload(models.Aktivitas.tim_terkait),
         joinedload(models.Aktivitas.users),
         # --- NEW: LOAD PARENT & CHILDREN ---
@@ -2393,6 +2484,86 @@ def update_aktivitas(
     db.refresh(db_aktivitas)
     return db_aktivitas
 
+@app.patch("/api/aktivitas/{aktivitas_id}/status", response_model=schemas.Aktivitas)
+def update_aktivitas_status(
+    aktivitas_id: int, 
+    status_data: schemas.AktivitasStatusUpdate, 
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(security.get_current_user)
+):
+    db_aktivitas = db.query(models.Aktivitas).options(
+        joinedload(models.Aktivitas.daftar_dokumen_wajib)
+    ).filter(models.Aktivitas.id == aktivitas_id).first()
+    
+    if not db_aktivitas:
+        raise HTTPException(status_code=404, detail="Aktivitas tidak ditemukan")
+    
+    new_status = status_data.status
+    
+    # 1. Logic: Hard-Blocking for "Menunggu Validasi"
+    if new_status == "Menunggu Validasi":
+        incomplete_docs = [d.nama_dokumen for d in db_aktivitas.daftar_dokumen_wajib if not d.status_pengecekan]
+        if incomplete_docs:
+            formatted_docs = ", ".join(incomplete_docs)
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Gagal memindahkan status. Dokumen berikut wajib dilengkapi: {formatted_docs}"
+            )
+    
+    # 2. Update Status
+    db_aktivitas.status = new_status
+    db.commit()
+    db.refresh(db_aktivitas)
+    
+    return db_aktivitas
+
+@app.post("/api/aktivitas/{aktivitas_id}/validate", response_model=schemas.Aktivitas)
+def validate_aktivitas(
+    aktivitas_id: int,
+    validation_data: schemas.AktivitasValidationRequest,
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(security.get_current_user)
+):
+    db_aktivitas = db.query(models.Aktivitas).options(
+        joinedload(models.Aktivitas.team),
+        joinedload(models.Aktivitas.project)
+    ).filter(models.Aktivitas.id == aktivitas_id).first()
+    
+    if not db_aktivitas:
+        raise HTTPException(status_code=404, detail="Aktivitas tidak ditemukan")
+    
+    # 1. Authorization: Only Team Leader or Project Leader
+    is_team_leader = db_aktivitas.team and db_aktivitas.team.ketua_tim_id == current_user.id
+    is_project_leader = db_aktivitas.project and db_aktivitas.project.project_leader_id == current_user.id
+    
+    if not (is_team_leader or is_project_leader or current_user.sistem_role.nama_role == "admin"):
+        raise HTTPException(status_code=403, detail="Hanya Ketua Tim atau Project Leader yang dapat memvalidasi aktivitas ini.")
+    
+    # 2. Update Status based on approval
+    if validation_data.approved:
+        db_aktivitas.status = "Selesai"
+        db_aktivitas.validated_by_id = current_user.id
+        db_aktivitas.validated_at = datetime.now()
+    else:
+        # Rejected, back to In Progress
+        db_aktivitas.status = "Dalam Proses"
+        
+    db_aktivitas.catatan_validator = validation_data.catatan
+    db.commit()
+    db.refresh(db_aktivitas)
+    
+    # 3. Notification to creator/members (Optional but good)
+    msg = "disetujui" if validation_data.approved else "butuh revisi"
+    create_notification(
+        db=db, user_id=db_aktivitas.creator_user_id,
+        title=f"Validasi: {db_aktivitas.nama_aktivitas}",
+        massage=f"Aktivitas Anda telah {msg} oleh {current_user.nama_lengkap}.",
+        link_to=f"/aktivitas/detail/{db_aktivitas.id}",
+        activity_id=db_aktivitas.id
+    )
+    
+    return db_aktivitas
+
 # --- ENDPOINT MENGHAPUS AKTIVITAS ---
 @app.delete("/api/aktivitas/{aktivitas_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_aktivitas(
@@ -2463,7 +2634,8 @@ def create_dokumen_untuk_aktivitas(
     keterangan: str = Form(...),
     checklist_item_id: Optional[int] = Form(None), # ID dari DaftarDokumen
     file: UploadFile = File(...),
-    db: Session = Depends(database.get_db)
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(security.get_current_user)
 ):
     # 1. Validasi Aktivitas
     aktivitas = db.query(models.Aktivitas).filter(models.Aktivitas.id == aktivitas_id).first()
@@ -2483,7 +2655,8 @@ def create_dokumen_untuk_aktivitas(
             path_atau_url=saved_path,       # Path baru (storage/2025/...)
             nama_file_asli=file.filename,   # Nama asli user (Laporan.pdf)
             tipe_file_mime=file.content_type,
-            daftar_dokumen_id=checklist_item_id # Relasi ke Item Checklist (One-to-Many)
+            daftar_dokumen_id=checklist_item_id, # Relasi ke Item Checklist (One-to-Many)
+            creator_user_id=current_user.id # <-- ADDED
         )
         
         db.add(db_dokumen)
@@ -2506,7 +2679,8 @@ def create_dokumen_untuk_aktivitas(
 def add_link_untuk_aktivitas(
     aktivitas_id: int,
     link_data: schemas.DokumenCreate,
-    db: Session = Depends(database.get_db)
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(security.get_current_user)
 ):
     # Cek dulu apakah aktivitasnya ada
     aktivitas = db.query(models.Aktivitas).filter(models.Aktivitas.id == aktivitas_id).first()
@@ -2520,7 +2694,8 @@ def add_link_untuk_aktivitas(
         tipe='LINK',
         path_atau_url=link_data.path_atau_url,
         nama_file_asli=link_data.nama_file_asli,
-        daftar_dokumen_id=link_data.checklist_item_id
+        daftar_dokumen_id=link_data.checklist_item_id,
+        creator_user_id=current_user.id # <-- ADDED
     )
 
     db.add(db_dokumen)
@@ -2535,7 +2710,8 @@ def create_dokumen_untuk_proyek(
     project_id: int,
     keterangan: str = Form(...),
     file: UploadFile = File(...),
-    db: Session = Depends(database.get_db)
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(security.get_current_user)
 ):
     project = db.query(models.Project).filter(models.Project.id == project_id).first()
     if not project:
@@ -2552,7 +2728,8 @@ def create_dokumen_untuk_proyek(
             tipe='FILE',
             path_atau_url=saved_path,
             nama_file_asli=file.filename,
-            tipe_file_mime=file.content_type
+            tipe_file_mime=file.content_type,
+            creator_user_id=current_user.id # <-- ADDED
         )
         db.add(db_dokumen)
         db.commit()
@@ -2570,7 +2747,8 @@ def create_dokumen_untuk_proyek(
 def add_link_untuk_proyek(
     project_id: int,
     link_data: schemas.DokumenCreate,
-    db: Session = Depends(database.get_db)
+    db: Session = Depends(database.get_db),
+    current_user: models.User = Depends(security.get_current_user)
 ):
     """
     Menambahkan link ke sebuah proyek.
@@ -2585,7 +2763,8 @@ def add_link_untuk_proyek(
         project_id=project_id,
         keterangan=link_data.keterangan,
         tipe='LINK',
-        path_atau_url=link_data.path_atau_url
+        path_atau_url=link_data.path_atau_url,
+        creator_user_id=current_user.id # <-- ADDED
     )
     
     db.add(db_dokumen)
@@ -3113,6 +3292,10 @@ def get_dashboard_stats(
             extract('month', models.Aktivitas.tanggal_mulai) == today.month,
             extract('year', models.Aktivitas.tanggal_mulai) == today.year
         ).count()
+        # GLOBAL: Butuh Validasi
+        stats.butuh_validasi = db.query(models.Aktivitas).filter(
+            models.Aktivitas.status == "Menunggu Validasi"
+        ).count()
 
     # -----------------------------------------------------------
     # 2. LOGIKA UNTUK KETUA TIM (Melihat Timnya)
@@ -3126,42 +3309,41 @@ def get_dashboard_stats(
     # Hanya jalankan perhitungan ketua tim jika user memang memimpin tim
     if tim_ketua_list:
         if team_id:
-            # KASUS A: Filter Spesifik Satu Tim
-            # Pastikan team_id yang diminta memang milik user ini
             target_tim = next((t for t in tim_ketua_list if t.id == team_id), None)
-            
             if target_tim:
-                # Hitung anggota via tabel link untuk akurasi
                 stats.total_anggota_tim = db.query(models.user_team_link).filter(
                     models.user_team_link.c.team_id == target_tim.id
                 ).count()
-                
                 stats.total_project = db.query(models.Project).filter(
                     models.Project.team_id == target_tim.id
                 ).count()
-                
                 stats.total_aktivitas_bulan_ini = db.query(models.Aktivitas).filter(
                     models.Aktivitas.team_id == target_tim.id,
                     extract('month', models.Aktivitas.tanggal_mulai) == today.month,
                     extract('year', models.Aktivitas.tanggal_mulai) == today.year
                 ).count()
+                # PER TEAM: Butuh Validasi
+                stats.butuh_validasi = db.query(models.Aktivitas).filter(
+                    models.Aktivitas.team_id == target_tim.id,
+                    models.Aktivitas.status == "Menunggu Validasi"
+                ).count()
         else:
-            # KASUS B: Agregat Semua Tim Saya
             managed_team_ids = [t.id for t in tim_ketua_list]
-            
-            # Hitung total anggota unik (jika perlu) atau total membership
             stats.total_anggota_tim = db.query(models.user_team_link).filter(
                 models.user_team_link.c.team_id.in_(managed_team_ids)
             ).count()
-            
             stats.total_project = db.query(models.Project).filter(
                 models.Project.team_id.in_(managed_team_ids)
             ).count()
-            
             stats.total_aktivitas_bulan_ini = db.query(models.Aktivitas).filter(
                 models.Aktivitas.team_id.in_(managed_team_ids),
                 extract('month', models.Aktivitas.tanggal_mulai) == today.month,
                 extract('year', models.Aktivitas.tanggal_mulai) == today.year
+            ).count()
+            # AGGREGATE TEAMS: Butuh Validasi
+            stats.butuh_validasi = db.query(models.Aktivitas).filter(
+                models.Aktivitas.team_id.in_(managed_team_ids),
+                models.Aktivitas.status == "Menunggu Validasi"
             ).count()
 
     # -----------------------------------------------------------
@@ -3184,6 +3366,30 @@ def get_dashboard_stats(
         .count()
     )
 
+    # -----------------------------------------------------------
+    # 4. STATUS COUNTS (Aggregated based on role)
+    # -----------------------------------------------------------
+    status_query = db.query(
+        models.Aktivitas.status,
+        func.count(models.Aktivitas.id).label('count')
+    )
+
+    if current_user.sistem_role_id in [1, 2] or current_user.jabatan_id == 1:
+        # Global stats for admin/head
+        pass
+    elif tim_ketua_list:
+        # Managed teams stats for leaders
+        managed_team_ids = [t.id for t in tim_ketua_list]
+        status_query = status_query.filter(models.Aktivitas.team_id.in_(managed_team_ids))
+    else:
+        # Personal stats for members
+        status_query = status_query.join(models.anggota_aktivitas_link).filter(
+            models.anggota_aktivitas_link.c.user_id == current_user.id
+        )
+    
+    status_results = status_query.group_by(models.Aktivitas.status).all()
+    stats.status_counts = {r.status: r.count for r in status_results}
+
     return stats
 
 
@@ -3201,23 +3407,17 @@ def get_dashboard_todo(
     today = date.today()
 
     # A. TUGAS ANGGOTA: Upload Dokumen yang Belum Ada
-    # Cari aktivitas aktif yang melibatkan user
-    # Lalu cari checklist item di dalamnya yang belum punya file
-    
-    # Subquery: Ambil aktivitas yang melibatkan user
     user_activities = db.query(models.Aktivitas).join(
         models.anggota_aktivitas_link
     ).filter(
         models.anggota_aktivitas_link.c.user_id == current_user.id,
-        # Opsional: Hanya aktivitas yang belum lewat jauh (misal 30 hari terakhir)
-        models.Aktivitas.tanggal_mulai >= today - timedelta(days=30) 
+        models.Aktivitas.tanggal_mulai >= today - timedelta(days=60) # Rentang lebih luas
     ).all()
 
     for akt in user_activities:
+        # 1. Dokumen yang belum diupload
         for item in akt.daftar_dokumen_wajib:
-            # Cek apakah item ini SUDAH punya file? (menggunakan relasi 'files')
             if not item.files: 
-                # Belum ada file -> Masukkan ke Todo List "Pending Upload"
                 todo_list.append({
                     "id": item.id,
                     "nama_dokumen": item.nama_dokumen,
@@ -3227,11 +3427,25 @@ def get_dashboard_todo(
                     "tanggal_mulai": akt.tanggal_mulai,
                     "nama_tim": akt.team.nama_tim if akt.team else "-",
                     "nama_project": akt.project.nama_project if akt.project else "-",
-                    "jenis_tugas": "upload" # Marker untuk frontend
+                    "jenis_tugas": "upload"
                 })
+        
+        # 2. Aktivitas yang belum dimulai/selesai tapi sudah dekat/lewat deadline
+        # (Masuk ke Todo jika status bukan Selesai/Menunggu Validasi dan tgl_mulai <= today)
+        if akt.status in ['Belum Selesai', 'Dalam Proses'] and akt.tanggal_mulai and akt.tanggal_mulai <= today:
+            todo_list.append({
+                "id": akt.id, # Pakai ID aktivitas
+                "nama_dokumen": "[AKTIVITAS] " + akt.nama_aktivitas,
+                "status_pengecekan": False,
+                "aktivitas_id": akt.id,
+                "nama_aktivitas": akt.nama_aktivitas,
+                "tanggal_mulai": akt.tanggal_mulai,
+                "nama_tim": akt.team.nama_tim if akt.team else "-",
+                "nama_project": akt.project.nama_project if akt.project else "-",
+                "jenis_tugas": "aktivitas_pending" # Tipe baru
+            })
 
-    # B. TUGAS KETUA TIM: Validasi Dokumen
-    # Cari tim yang dipimpin user
+    # B. TUGAS KETUA TIM: Validasi Dokumen & Validasi Aktivitas
     tim_ketua = db.query(models.Team).filter(
         models.Team.ketua_tim_id == current_user.id,
         models.Team.valid_until >= today
@@ -3240,20 +3454,14 @@ def get_dashboard_todo(
     tim_ids = [t.id for t in tim_ketua]
     
     if tim_ids:
-        # Cari checklist item di tim ini yang ADA file tapi BELUM divalidasi
-        pending_validation_items = db.query(models.DaftarDokumen).join(
-            models.Aktivitas
-        ).options(
-            joinedload(models.DaftarDokumen.aktivitas).joinedload(models.Aktivitas.team),
-            joinedload(models.DaftarDokumen.aktivitas).joinedload(models.Aktivitas.project),
-            joinedload(models.DaftarDokumen.files) # Load files untuk pengecekan
-        ).filter(
+        # 1. Validasi Dokumen (Existing)
+        pending_doc_validation = db.query(models.DaftarDokumen).join(models.Aktivitas).filter(
             models.Aktivitas.team_id.in_(tim_ids),
-            models.DaftarDokumen.status_pengecekan == False, # Belum valid
-            models.DaftarDokumen.files.any() # TAPI sudah ada file (artinya butuh review)
-        ).limit(20).all() # Limit agar tidak kebanyakan
+            models.DaftarDokumen.status_pengecekan == False,
+            models.DaftarDokumen.files.any()
+        ).limit(20).all()
 
-        for item in pending_validation_items:
+        for item in pending_doc_validation:
             akt = item.aktivitas
             todo_list.append({
                 "id": item.id,
@@ -3264,12 +3472,30 @@ def get_dashboard_todo(
                 "tanggal_mulai": akt.tanggal_mulai,
                 "nama_tim": akt.team.nama_tim if akt.team else "-",
                 "nama_project": akt.project.nama_project if akt.project else "-",
-                "jenis_tugas": "validasi" # Marker untuk frontend
+                "jenis_tugas": "validasi"
             })
 
-    # Sortir berdasarkan tanggal (yang paling mendesak/lama di atas)
-    # Disini kita sort desc (terbaru dulu) atau asc (terlama dulu) terserah
-    todo_list.sort(key=lambda x: x['tanggal_mulai'] or date.min, reverse=True)
+        # 2. Validasi Seluruh Aktivitas (NEW)
+        pending_aktivitas_validation = db.query(models.Aktivitas).filter(
+            models.Aktivitas.team_id.in_(tim_ids),
+            models.Aktivitas.status == "Menunggu Validasi"
+        ).all()
+
+        for akt in pending_aktivitas_validation:
+            todo_list.append({
+                "id": akt.id,
+                "nama_dokumen": "[VALIDASI] " + akt.nama_aktivitas,
+                "status_pengecekan": False,
+                "aktivitas_id": akt.id,
+                "nama_aktivitas": akt.nama_aktivitas,
+                "tanggal_mulai": akt.tanggal_mulai,
+                "nama_tim": akt.team.nama_tim if akt.team else "-",
+                "nama_project": akt.project.nama_project if akt.project else "-",
+                "jenis_tugas": "validasi_aktivitas"
+            })
+
+    # Sortir: Overdue (lewat tanggal) di atas sendiri
+    todo_list.sort(key=lambda x: x['tanggal_mulai'] or date.max)
 
     return todo_list
 
