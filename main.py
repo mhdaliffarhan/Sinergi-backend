@@ -24,6 +24,8 @@ app = FastAPI()
 origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
 ]
 
 app.add_middleware(
@@ -184,16 +186,17 @@ def create_notification(
     user = db.query(models.User).filter(models.User.id == user_id).first()
 
     if user and user.nohp and send_whatsapp:
-        base_url = "https://sinergi.statsntb.id" 
+        base_url = "https://satset.statsntb.id" 
         full_link = f"{base_url}{link_to}"
         wa_message = ""
 
         if wa_message_override:
             wa_message = wa_message_override.replace("{LINK}", full_link)
         else:
-            wa_message = f"🔔 *Notifikasi SINERGI*\n\n"
+            wa_message = f"🔔 *Notifikasi SATSET*\n\n"
             wa_message += f"*{title}*\n"
             wa_message += f"{massage}\n\n"
+            wa_message += f"Kolaborasi Cepat, Dokumentasi Tertata\n"
             wa_message += f"Lihat detail:\n{full_link}"
 
         new_queue = models.WaQueue(
@@ -965,11 +968,11 @@ def request_password_reset(
         )
 
         # Buat link dan pesan WA
-        base_url = "https://sinergi.statsntb.id" # URL Frontend Anda
+        base_url = "https://satset.statsntb.id" # URL Frontend Anda
         full_link = f"{base_url}/reset-password?token={reset_token}"
 
         wa_message = (
-            f"🔑 *Permintaan Reset Password SINERGI*\n\n"
+            f"🔑 *Permintaan Reset Password SATSET*\n\n"
             f"Halo {user.nama_lengkap},\n"
             f"Kami menerima permintaan untuk mereset password akun Anda. "
             f"Silakan klik link di bawah ini untuk melanjutkan:\n\n"
@@ -1854,7 +1857,7 @@ def download_aktivitas_excel(
         cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
 
     # --- ISI DATA ---
-    base_url = "https://sinergi.statsntb.id" 
+    base_url = "https://satset.statsntb.id" 
     
     # Gunakan enumerate untuk mendapatkan nomor urut (index) mulai dari 1
     for index, aktivitas in enumerate(aktivitas_list, start=1):
