@@ -13,7 +13,9 @@ from openpyxl.styles import Alignment
 from jose import JWSError, jwt
 from pydantic import BaseModel  
 
-import models, database, schemas, security, uuid, httpx, io, os, shutil, uuid, io, zipfile, services_wa, asyncio, tempfile, re, random
+import models, database, schemas, security, uuid, httpx, io, os, shutil, uuid, io, zipfile, services_wa, asyncio, tempfile, re, random, time
+from cron_wa_reminder_processor import process_reminders
+from cron_wa_sender import process_wa_queue
 
 # ===================================================================
 # INISIALISASI & KONFIGURASI
@@ -93,6 +95,34 @@ async def send_whatsapp_safe(phone_number: str, message: str, sequence_index: in
         services_wa.send_whatsapp_message(phone_number, message)
     except Exception as e:
         print(f"Gagal mengirim WA ke {phone_number}: {e}")
+
+# ===================================================================
+# BACKGROUND WORKER LOOP
+# ===================================================================
+async def background_wa_worker():
+    """
+    Loop background untuk memproses reminder dan mengirim antrian WA setiap menit.
+    """
+    print("🚀 Background WA Worker started...")
+    while True:
+        try:
+            # 1. Pindahkan reminder yang due ke wa_queue (Sync)
+            # Karena process_reminders itu sync, kita panggil di thread pool agar tidak memblokir event loop
+            await asyncio.to_thread(process_reminders)
+            
+            # 2. Proses wa_queue (Async)
+            await process_wa_queue()
+            
+        except Exception as e:
+            print(f"❌ Error in background_wa_worker: {e}")
+        
+        # Tunggu 1 menit sebelum iterasi berikutnya
+        await asyncio.sleep(60)
+
+@app.on_event("startup")
+async def startup_event():
+    # Jalankan worker di background saat aplikasi mulai
+    asyncio.create_task(background_wa_worker())
 
 def get_document_path(db: Session, project_id: Optional[int] = None, aktivitas_id: Optional[int] = None):
     """
@@ -448,7 +478,8 @@ async def sso_callback(request: SSOCallbackRequest, db: Session = Depends(databa
             raise HTTPException(status_code=400, detail="Data user SSO tidak valid")
 
         nama_lengkap = pegawai.get("nama_lengkap") or sso_user.get("name") or username
-        nip_sso = pegawai.get("nip_bps")
+        nip_sso = pegawai.get("nip") # 18 digit
+        nip_bps_sso = pegawai.get("nip_bps") # 9 digit
 
         # 4️⃣ Cari user lokal
         local_user = db.query(models.User).filter_by(username=username).first()
@@ -459,6 +490,7 @@ async def sso_callback(request: SSOCallbackRequest, db: Session = Depends(databa
                 username=username,
                 nama_lengkap=nama_lengkap,
                 nip=nip_sso,
+                nipbps=nip_bps_sso,
                 sistem_role_id=3,
                 jabatan_id=2,
                 is_active=True,
@@ -471,6 +503,7 @@ async def sso_callback(request: SSOCallbackRequest, db: Session = Depends(databa
             # Sinkronisasi profil
             local_user.nama_lengkap = nama_lengkap
             local_user.nip = nip_sso
+            local_user.nipbps = nip_bps_sso
             local_user.last_login = datetime.now()
 
         db.commit()
@@ -1692,6 +1725,9 @@ def create_aktivitas(
     tim_terkait_ids = aktivitas_payload.pop('id_tim_terkait', []) 
     # ^ ------------------ ^
 
+    # Pop Reminders agar tidak error saat inisialisasi model
+    reminders = aktivitas_payload.pop('reminders', [])
+
     # Hapus field helper form
     aktivitas_payload.pop('use_date_range', None)
     aktivitas_payload.pop('use_time', None)
@@ -1718,17 +1754,56 @@ def create_aktivitas(
                 models.DaftarDokumen(nama_dokumen=nama_dok, status_pengecekan=False)
             )
 
-    # C. Tim Terkait (LOGIKA UTAMA)
-    if tim_terkait_ids:
-        # Filter ID unik dan pastikan bukan tim penyelenggara sendiri
-        unique_tim_ids = list(set(tim_terkait_ids))
-        if db_aktivitas.team_id in unique_tim_ids:
-            unique_tim_ids.remove(db_aktivitas.team_id)
-            
-        if unique_tim_ids:
-            teams_to_add = db.query(models.Team).filter(models.Team.id.in_(unique_tim_ids)).all()
             # Masukkan ke relasi 'tim_terkait'
             db_aktivitas.tim_terkait.extend(teams_to_add)
+
+    # D. WA Reminders (LOGIKA BARU)
+    if reminders:
+        from datetime import time as dt_time
+        for rem in reminders:
+            scheduled_at = None
+            rt = rem.get('reminder_type')
+            if rt == 'hari_h' and db_aktivitas.tanggal_mulai:
+                # Hari-H jam 07:00 WITA
+                scheduled_at = datetime.combine(db_aktivitas.tanggal_mulai, dt_time(7, 0))
+            elif rt == 'h_minus_1' and db_aktivitas.tanggal_mulai:
+                # H-1 jam 07:00 WITA
+                target_date = db_aktivitas.tanggal_mulai - timedelta(days=1)
+                scheduled_at = datetime.combine(target_date, dt_time(7, 0))
+            elif rt == 'h_minus_2' and db_aktivitas.tanggal_mulai:
+                # H-2 jam 07:00 WITA
+                target_date = db_aktivitas.tanggal_mulai - timedelta(days=2)
+                scheduled_at = datetime.combine(target_date, dt_time(7, 0))
+            elif rt == 'jam_minus_1' and db_aktivitas.tanggal_mulai and db_aktivitas.jam_mulai:
+                # 1 jam sebelum jam_mulai
+                dt_base = datetime.combine(db_aktivitas.tanggal_mulai, db_aktivitas.jam_mulai)
+                scheduled_at = dt_base - timedelta(hours=1)
+            elif rt == 'jam_minus_2' and db_aktivitas.tanggal_mulai and db_aktivitas.jam_mulai:
+                # 2 jam sebelum jam_mulai
+                dt_base = datetime.combine(db_aktivitas.tanggal_mulai, db_aktivitas.jam_mulai)
+                scheduled_at = dt_base - timedelta(hours=2)
+            elif rt == 'deadline' and db_aktivitas.tanggal_selesai:
+                # Hari Deadline (Hari Terakhir) jam 07:00 WITA
+                scheduled_at = datetime.combine(db_aktivitas.tanggal_selesai, dt_time(7, 0))
+            elif rt == 'deadline_minus_1' and db_aktivitas.tanggal_selesai:
+                # H-1 Deadline jam 07:00 WITA
+                target_date = db_aktivitas.tanggal_selesai - timedelta(days=1)
+                scheduled_at = datetime.combine(target_date, dt_time(7, 0))
+            elif rt == 'deadline_minus_2' and db_aktivitas.tanggal_selesai:
+                # H-2 Deadline jam 07:00 WITA
+                target_date = db_aktivitas.tanggal_selesai - timedelta(days=2)
+                scheduled_at = datetime.combine(target_date, dt_time(7, 0))
+            elif rt == 'manual':
+                scheduled_at = rem.get('scheduled_at')
+
+            if scheduled_at:
+                db_reminder = models.AktivitasReminder(
+                    aktivitas_id=db_aktivitas.id,
+                    reminder_type=rt,
+                    scheduled_at=scheduled_at,
+                    is_active=rem.get('is_active', True)
+                )
+                db_aktivitas.reminders.append(db_reminder)
 
     # 4. SIMPAN
     db.add(db_aktivitas)
@@ -2079,15 +2154,46 @@ def update_aktivitas(
     update_data.pop('use_date_range', None)
     update_data.pop('use_time', None)
     
+    # Pop Reminders agar tidak error saat update field
+    reminders = update_data.pop('reminders', None)
+    
     # Pisahkan data relasi
     anggota_ids = update_data.pop('anggota_aktivitas_ids', None)
     doc_wajib_names = update_data.pop('daftar_dokumen_wajib', None)
     tim_terkait_ids = update_data.pop('id_tim_terkait', None) 
 
     # 2. Update Field Dasar
+    core_fields_to_track = ['nama_aktivitas', 'tanggal_mulai', 'tanggal_selesai', 'jam_mulai', 'jam_selesai']
+    core_info_changed = False
+    
     for key, value in update_data.items():
         if hasattr(db_aktivitas, key):
+            if key in core_fields_to_track:
+                old_val = getattr(db_aktivitas, key)
+                if old_val != value:
+                    core_info_changed = True
             setattr(db_aktivitas, key, value)
+    
+    # Jika info inti berubah, batalkan semua antrean pending agar digenerate ulang dengan info baru
+    if core_info_changed:
+        db.query(models.WaQueue).filter(
+            models.WaQueue.aktivitas_id == aktivitas_id,
+            models.WaQueue.status == 'pending'
+        ).update({"status": "cancelled"})
+    
+    # --- LOGIKA PEMBATALAN REMINDER (JIKA STATUS DIBATALKAN) ---
+    if db_aktivitas.status == 'Dibatalkan':
+        # Mark pending reminders as cancelled
+        db.query(models.AktivitasReminder).filter(
+            models.AktivitasReminder.aktivitas_id == aktivitas_id,
+            models.AktivitasReminder.status == 'pending'
+        ).update({"status": "cancelled"})
+        
+        # Mark pending queue items as cancelled
+        db.query(models.WaQueue).filter(
+            models.WaQueue.aktivitas_id == aktivitas_id,
+            models.WaQueue.status == 'pending'
+        ).update({"status": "cancelled"})
     
     # 3. Update Anggota & Deteksi Perubahan (LOGIKA UTAMA)
     if anggota_ids is not None:
@@ -2175,9 +2281,19 @@ def update_aktivitas(
                     )
 
             # B. Notifikasi untuk User yang DIHAPUS (Format Informatif)
-            for uid in removed_ids:
-                user = db.query(models.User).filter(models.User.id == uid).first()
-                if user:
+            if removed_ids:
+                # --- [OPTIMASI] Batalkan antrean WA pending untuk user yang dihapus ---
+                removed_users = db.query(models.User).filter(models.User.id.in_(list(removed_ids))).all()
+                removed_nohps = [u.nohp for u in removed_users if u.nohp]
+                
+                if removed_nohps:
+                    db.query(models.WaQueue).filter(
+                        models.WaQueue.aktivitas_id == aktivitas_id,
+                        models.WaQueue.status == 'pending',
+                        models.WaQueue.phone_number.in_(removed_nohps)
+                    ).update({"status": "cancelled"})
+
+                for user in removed_users:
                     wa_msg_remove = (
                         f"ℹ️ *Update Aktivitas*\n\n"
                         f"Halo {user.nama_lengkap},\n"
@@ -2186,7 +2302,7 @@ def update_aktivitas(
                         f"Anda tidak lagi terlibat dalam aktivitas tersebut."
                     )
                     create_notification(
-                        db=db, user_id=uid, 
+                        db=db, user_id=user.id, 
                         title=f"Dikeluarkan: {nama_aktivitas}",
                         massage="Anda telah dikeluarkan dari aktivitas ini.",
                         link_to="#", 
@@ -2220,6 +2336,58 @@ def update_aktivitas(
         if unique_tim_ids:
             teams_to_add = db.query(models.Team).filter(models.Team.id.in_(unique_tim_ids)).all()
             db_aktivitas.tim_terkait.extend(teams_to_add)
+
+    # 6. Update WA Reminders (LOGIKA BARU - Optimized)
+    if reminders is not None:
+        # Ambil tipe reminder yang sudah pernah dikirim (agar tidak double send)
+        sent_reminder_types = {r.reminder_type for r in db_aktivitas.reminders if r.status == 'sent'}
+        
+        # Hapus yang masih pending/cancelled untuk diganti/sinkronkan
+        db.query(models.AktivitasReminder).filter(
+            models.AktivitasReminder.aktivitas_id == aktivitas_id,
+            models.AktivitasReminder.status != 'sent'
+        ).delete()
+        
+        from datetime import time as dt_time
+        for rem in reminders:
+            rt = rem.get('reminder_type')
+            # Jika tipe ini sudah pernah terkirim, jangan buat lagi
+            if rt in sent_reminder_types:
+                continue
+                
+            scheduled_at = None
+            if rt == 'hari_h' and db_aktivitas.tanggal_mulai:
+                scheduled_at = datetime.combine(db_aktivitas.tanggal_mulai, dt_time(7, 0))
+            elif rt == 'h_minus_1' and db_aktivitas.tanggal_mulai:
+                target_date = db_aktivitas.tanggal_mulai - timedelta(days=1)
+                scheduled_at = datetime.combine(target_date, dt_time(7, 0))
+            elif rt == 'h_minus_2' and db_aktivitas.tanggal_mulai:
+                target_date = db_aktivitas.tanggal_mulai - timedelta(days=2)
+                scheduled_at = datetime.combine(target_date, dt_time(7, 0))
+            elif rt == 'jam_minus_1' and db_aktivitas.tanggal_mulai and db_aktivitas.jam_mulai:
+                dt_base = datetime.combine(db_aktivitas.tanggal_mulai, db_aktivitas.jam_mulai)
+                scheduled_at = dt_base - timedelta(hours=1)
+            elif rt == 'jam_minus_2' and db_aktivitas.tanggal_mulai and db_aktivitas.jam_mulai:
+                dt_base = datetime.combine(db_aktivitas.tanggal_mulai, db_aktivitas.jam_mulai)
+                scheduled_at = dt_base - timedelta(hours=2)
+            elif rt == 'deadline' and db_aktivitas.tanggal_selesai:
+                scheduled_at = datetime.combine(db_aktivitas.tanggal_selesai, dt_time(7, 0))
+            elif rt == 'deadline_minus_1' and db_aktivitas.tanggal_selesai:
+                target_date = db_aktivitas.tanggal_selesai - timedelta(days=1)
+                scheduled_at = datetime.combine(target_date, dt_time(7, 0))
+            elif rt == 'deadline_minus_2' and db_aktivitas.tanggal_selesai:
+                target_date = db_aktivitas.tanggal_selesai - timedelta(days=2)
+                scheduled_at = datetime.combine(target_date, dt_time(7, 0))
+            elif rt == 'manual':
+                scheduled_at = rem.get('scheduled_at')
+
+            if scheduled_at:
+                db_reminder = models.AktivitasReminder(
+                    reminder_type=rt,
+                    scheduled_at=scheduled_at,
+                    is_active=rem.get('is_active', True)
+                )
+                db_aktivitas.reminders.append(db_reminder)
 
     db.commit()
     db.refresh(db_aktivitas)
@@ -2269,6 +2437,12 @@ def delete_aktivitas(
 
         db.commit() # Commit notifikasi
     # --- END LOGIKA NOTIFIKASI ---
+
+    # --- LOGIKA PEMBATALAN ANTRIAN SEBELUM HAPUS ---
+    db.query(models.WaQueue).filter(
+        models.WaQueue.aktivitas_id == aktivitas_id,
+        models.WaQueue.status == 'pending'
+    ).update({"status": "cancelled"})
 
     # Hapus semua entri di tabel perantara 'anggota_aktivitas' secara manual
     db.query(models.anggota_aktivitas_link).filter(models.anggota_aktivitas_link.c.aktivitas_id == aktivitas_id).delete(synchronize_session=False)

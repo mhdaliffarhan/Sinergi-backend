@@ -88,6 +88,23 @@ class StatusPengecekanUpdate(CamelModel):
 
 
 # ===================================================================
+# 3.5 SKEMA WA REMINDER
+# ===================================================================
+class ReminderBase(CamelModel):
+    reminder_type: str # 'manual', 'hari_h', 'h_minus_1', 'h_minus_2', 'jam_minus_1', 'jam_minus_2', 'deadline', 'deadline_minus_1', 'deadline_minus_2'
+    scheduled_at: Optional[datetime] = None # Untuk manual
+    is_active: bool = True
+
+class ReminderCreate(ReminderBase):
+    pass
+
+class Reminder(ReminderBase):
+    id: int
+    status: str
+    created_at: datetime
+
+
+# ===================================================================
 # 4. SKEMA USER (Partial/Embedded)
 # ===================================================================
 class UserInTeam(CamelModel):
@@ -309,6 +326,7 @@ class AktivitasBase(CamelModel):
 class AktivitasCreate(AktivitasBase):
     daftar_dokumen_wajib: List[str] = []
     anggota_aktivitas_ids: List[int] = []
+    reminders: List[ReminderCreate] = [] # <--- BARU
     send_whatsapp: bool = True
 
     @model_validator(mode='before')
@@ -329,6 +347,7 @@ class AktivitasUpdate(AktivitasBase):
     nama_aktivitas: Optional[str] = None
     daftar_dokumen_wajib: List[str] = []
     anggota_aktivitas_ids: List[int] = []
+    reminders: List[ReminderCreate] = [] # <--- BARU
     status: Optional[str] = None
     kalender_view: Optional[bool] = None
     parent_id: Optional[int] = None
@@ -469,6 +488,7 @@ class Aktivitas(AktivitasBase):
     daftar_dokumen_wajib: List[DaftarDokumen] = []
     users: List[UserInAktivitas] = []
     tim_terkait: List[Team] = [] # Relasi ke Team
+    reminders: List[Reminder] = [] # <--- BARU
     
     # --- HIERARKI ---
     parent: Optional[AktivitasParent] = None

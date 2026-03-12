@@ -91,6 +91,7 @@ class Aktivitas(Base):
     daftar_dokumen_wajib = relationship("DaftarDokumen", back_populates="aktivitas", cascade="all, delete-orphan")
     users = relationship("User", secondary=anggota_aktivitas_link, back_populates="aktivitas", cascade="all, delete")
     tim_terkait = relationship("Team", secondary=aktivitas_tim_terkait_link, back_populates='aktivitas_terkait')
+    reminders = relationship("AktivitasReminder", back_populates="aktivitas", cascade="all, delete-orphan")
 
     # Self-Referential Relationships (Parent <-> Children)
     parent = relationship("Aktivitas", remote_side=[id], back_populates="children")
@@ -189,13 +190,28 @@ class Notifikasi(Base):
 
     user = relationship("User", back_populates="notifikasi")
 
+class AktivitasReminder(Base):
+    __tablename__ = "aktivitas_reminders"
+
+    id = Column(Integer, primary_key=True, index=True)
+    aktivitas_id = Column(Integer, ForeignKey("aktivitas.id", ondelete="CASCADE"), nullable=False)
+    reminder_type = Column(String(20), nullable=False) # 'manual', 'hari_h', 'h_minus_2'
+    scheduled_at = Column(DateTime(timezone=True), nullable=False)
+    status = Column(String(20), default="pending", index=True) # 'pending', 'sent', 'failed', 'cancelled'
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    aktivitas = relationship("Aktivitas", back_populates="reminders")
+
 class WaQueue(Base):
     __tablename__ = "wa_queue"
 
     id = Column(Integer, primary_key=True, index=True)
     phone_number = Column(String(50), nullable=False)
     message = Column(Text, nullable=False)
-    status = Column(String(20), default="pending", index=True) 
+    status = Column(String(20), default="pending", index=True) # 'pending', 'sent', 'failed', 'cancelled'
+    scheduled_at = Column(DateTime(timezone=True), nullable=True) # Audit: kapan seharusnya dikirim
+    aktivitas_id = Column(Integer, ForeignKey("aktivitas.id", ondelete="CASCADE"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     sent_at = Column(DateTime(timezone=True), nullable=True)
